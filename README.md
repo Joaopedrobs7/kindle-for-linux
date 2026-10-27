@@ -15,13 +15,13 @@ Kindle Cloud e EPUB na mesma estante.
 Linux / macOS:
 
 ```bash
-curl -fsSL https://joaopedrobs7.github.io/kindle-for-linux/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Joaopedrobs7/kindle-for-linux/main/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```bash
-irm https://joaopedrobs7.github.io/kindle-for-linux/install.ps1 | iex
+irm https://raw.githubusercontent.com/Joaopedrobs7/kindle-for-linux/main/install.ps1 | iex
 ```
 
 Os arquivos (`.deb`, `.AppImage`, `.dmg`, `.msi`) estão nas [Releases](https://github.com/Joaopedrobs7/kindle-for-linux/releases).
