@@ -1,5 +1,29 @@
 # Kindle para Linux
 
+## Instalação rápida (Ubuntu / Debian)
+
+Um comando baixa o pacote publicado e instala o **Kindle para Linux**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Joaopedrobs7/kindle-for-linux/main/install.sh | sudo bash
+```
+
+O mesmo instalador está no GitHub Pages:
+
+```bash
+curl -fsSL https://joaopedrobs7.github.io/kindle-for-linux/install.sh | sudo bash
+```
+
+Quando o repositório APT responde, o script grava `/etc/apt/sources.list.d/kindle-linux.list`. A partir daí o apt instala e atualiza o pacote:
+
+```bash
+echo 'deb [trusted=yes] https://joaopedrobs7.github.io/kindle-for-linux ./' | sudo tee /etc/apt/sources.list.d/kindle-linux.list
+sudo apt update
+sudo apt install kindle-para-linux
+```
+
+O atalho **Kindle para Linux** fica no menu de aplicações. No terminal, o comando é `kindle-linux`. O pacote é amd64 e depende de `libwebkit2gtk-4.1-0` e `libgtk-3-0`.
+
 Cliente de desktop em Rust e Tauri para ler, na mesma estante, a biblioteca Kindle na nuvem e EPUBs locais.
 
 A conta Amazon abre numa janela WebKit com User-Agent de Chrome. Os cookies da sessão (`ubid-acbbr`, `x-acbbr`, `at-acbbr`, `session-id`, `session-token`, `x-main`, `at-main`, `uhura`, `deviceSessionToken`) ficam no SQLite deste computador. O aplicativo busca a biblioteca, a posição Whispersync e os destaques pelos endpoints do Kindle Cloud Reader. O texto protegido continua no leitor oficial, só que sem a barra da Amazon. Não há remoção de DRM.
