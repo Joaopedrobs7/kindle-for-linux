@@ -8,12 +8,18 @@ export function Shelf({
   onQuery,
   onOpen,
   onRemove,
+  signedIn = true,
+  onLogin,
+  onImport,
 }: {
   books: Book[]
   query: string
   onQuery: (query: string) => void
   onOpen: (book: Book) => void
   onRemove: (book: Book) => void
+  signedIn?: boolean
+  onLogin?: () => void
+  onImport?: () => void
 }) {
   const [layout, setLayout] = useState<'grid' | 'list'>('grid')
   const visible = useMemo(() => {
@@ -42,7 +48,18 @@ export function Shelf({
         </div>
       </header>
       {visible.length === 0 ? (
-        <p className="empty">Nenhum livro com esse nome. A pasta observada é <code>/workspace/kindle</code>.</p>
+        books.length === 0 && !signedIn ? (
+          <div className="welcome">
+            <h2>Sua biblioteca começa aqui</h2>
+            <p>Entre com a Amazon para trazer os livros da Kindle Cloud, ou importe um EPUB.</p>
+            <div className="button-row">
+              <button type="button" className="solid" onClick={onLogin}>Entrar com a Amazon</button>
+              <button type="button" className="line" onClick={onImport}>Importar EPUB</button>
+            </div>
+          </div>
+        ) : (
+          <p className="empty">Nenhum livro com esse nome. A pasta observada é <code>/workspace/kindle</code>.</p>
+        )
       ) : layout === 'grid' ? (
         <div className="grid">
           {visible.map((book) => (

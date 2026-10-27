@@ -3,8 +3,7 @@ import {
   addBookmark,
   addHighlight,
   bookCfi,
-  cloudCapture,
-  cloudImportCookies,
+  cloudCloseReader,
   cloudLoadExample,
   cloudOpenLogin,
   cloudOpenReader,
@@ -12,6 +11,7 @@ import {
   cloudSyncBook,
   exportClippings,
   importEpub,
+  inTauri,
   loadSnapshot,
   patchReader,
   readBook,
@@ -49,7 +49,49 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    void refresh().catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Falha ao abrir a estante'))
+    let stops: Array<() => void> = []
+    let cancel = false
+    void (async () => {
+      try {
+        const next = await loadSnapshot()
+        if (cancel) return
+        setSnap(next)
+        if (inTauri() && next.session.signedIn) {
+          try {
+            const synced = await cloudSync(next.settings.region)
+            if (!cancel) setSnap(synced)
+          } catch {
+            /* a estante local continua visível */
+          }
+        }
+      } catch (error: unknown) {
+        if (!cancel) setMessage(error instanceof Error ? error.message : 'Falha ao abrir a estante')
+      }
+    })()
+    if (inTauri()) {
+      void import('@tauri-apps/api/event')
+        .then(({ listen }) =>
+          Promise.all([
+            listen('library-changed', () => {
+              void refresh()
+            }),
+            listen('cloud-reader-closed', () => {
+              setReading((current) => (current?.source === 'cloud' ? null : current))
+              setView('shelf')
+              void refresh()
+            }),
+          ]),
+        )
+        .then((unlisten) => {
+          if (cancel) unlisten.forEach((stop) => stop())
+          else stops = unlisten
+        })
+        .catch(() => undefined)
+    }
+    return () => {
+      cancel = true
+      stops.forEach((stop) => stop())
+    }
   }, [refresh])
 
   useEffect(() => {
@@ -62,7 +104,15 @@ export function App() {
           return !value
         })
       } else if (event.key === 'Escape') {
-        setCommand({ id: Date.now(), name: 'escape' })
+        if (reading?.source === 'cloud') {
+          event.preventDefault()
+          setReading(null)
+          setView('shelf')
+          void cloudCloseReader()
+          void refresh()
+        } else {
+          setCommand({ id: Date.now(), name: 'escape' })
+        }
       } else if (meta && event.key.toLowerCase() === 'f' && reading) {
         event.preventDefault()
         setCommand({ id: Date.now(), name: 'search' })
@@ -76,9 +126,11 @@ export function App() {
         event.preventDefault()
         setCommand({ id: Date.now(), name: 'zoom-out' })
       } else if (meta && event.key === '1') {
+        if (reading?.source === 'cloud') void cloudCloseReader()
         setReading(null)
         setView('shelf')
       } else if (meta && event.key === '2') {
+        if (reading?.source === 'cloud') void cloudCloseReader()
         setReading(null)
         setView('cloud')
       }
@@ -87,10 +139,26 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [reading])
 
+  function closeCloudReader() {
+    setReading(null)
+    setView('shelf')
+    void cloudCloseReader()
+    void refresh()
+  }
+
+  async function openCloudBook(book: Book) {
+    setReading(book)
+    setView('shelf')
+    try {
+      await cloudOpenReader(book.asin, book.title)
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Não abriu o leitor da Amazon')
+    }
+  }
+
   async function openBook(book: Book) {
     if (book.source === 'cloud') {
-      setView('cloud')
-      try { await cloudOpenReader(book.asin) } catch (error) { setMessage(error instanceof Error ? error.message : 'Não abriu o leitor da Amazon') }
+      await openCloudBook(book)
       return
     }
     setReading(book)
@@ -131,7 +199,27 @@ export function App() {
     <div className="app" data-appearance={appearance} data-fullscreen={full ? 'yes' : 'no'}>
       {!reading && <Sidebar view={view} onNavigate={(next) => { setView(next); setMessage('') }} />}
       <main>
-        {reading ? (
+        {reading?.source === 'cloud' ? (
+          <div className="cloud-read" data-testid="cloud-reader">
+            <header className="reader-bar">
+              <button type="button" onClick={closeCloudReader}>← Biblioteca</button>
+              <span aria-hidden="true">·</span>
+              <strong className="reader-bar-title">{reading.title}</strong>
+              <span className="reader-bar-author">{reading.author}</span>
+              <span className="reader-bar-spacer" />
+              <button
+                type="button"
+                onClick={() => setFull((value) => {
+                  void setFullscreen(!value)
+                  return !value
+                })}
+              >
+                Tela cheia
+              </button>
+            </header>
+            <p className="cloud-read-wait">Abrindo o livro…</p>
+          </div>
+        ) : reading ? (
           <Reader
             key={reading.id}
             bookId={reading.id}
@@ -157,6 +245,9 @@ export function App() {
             onQuery={setQuery}
             onOpen={(book) => void openBook(book)}
             onRemove={(book) => void removeBook(book.id).then(setSnap)}
+            signedIn={snap.session.signedIn}
+            onLogin={() => void cloudOpenLogin(snap.settings.region).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Abra pelo aplicativo de desktop para entrar na Amazon'))}
+            onImport={() => setView('settings')}
           />
         ) : view === 'notebook' ? (
           <Notebook
@@ -169,18 +260,32 @@ export function App() {
           <Cloud
             books={snap.books}
             session={snap.session}
+            region={snap.settings.region}
             busy={busy}
             message={message}
             onRegion={(region) => void saveSettings({ ...snap.settings, region }).then(setSnap)}
             onLogin={() => void cloudOpenLogin(snap.settings.region).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Abra pelo aplicativo de desktop para entrar na Amazon'))}
-            onCapture={() => void cloudCapture().then(setSnap).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Sem sessão'))}
-            onImport={(header) => void cloudImportCookies(header, snap.settings.region).then(setSnap).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Cookie inválido'))}
             onSync={() => {
               setBusy(true)
-              void cloudSync().then(setSnap).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Falha ao sincronizar')).finally(() => setBusy(false))
+              void cloudSync(snap.settings.region).then(setSnap).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Falha ao sincronizar')).finally(() => setBusy(false))
             }}
             onExample={() => void cloudLoadExample().then((next) => { setSnap(next); setMessage('Exemplo offline da Kindle Cloud, sem credenciais.') })}
-            onOpen={(asin) => void cloudOpenReader(asin).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'O leitor da Amazon abre na janela do aplicativo'))}
+            onOpen={(asin) => {
+              const book = snap.books.find((item) => item.asin === asin) ?? {
+                id: `cloud:${asin}`,
+                source: 'cloud',
+                asin,
+                title: asin,
+                author: '',
+                filePath: '',
+                cover: '',
+                percentage: 0,
+                chapterTitle: '',
+                missing: false,
+                addedAt: 0,
+              }
+              void openCloudBook(book)
+            }}
             onAnnotations={(asin) => {
               setBusy(true)
               void cloudSyncBook(asin).then(setSnap).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Sem anotações')).finally(() => setBusy(false))

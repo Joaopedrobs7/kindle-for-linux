@@ -67,6 +67,8 @@ test('estante, leitor, caderno e exemplo da nuvem', async ({ page }) => {
   await expect(page.getByTestId('notebook')).toBeVisible()
 
   await page.getByRole('button', { name: 'Nuvem Amazon' }).click()
+  await expect(page.getByRole('button', { name: 'Entrar com a Amazon' })).toBeVisible()
+  await page.getByText('Opções avançadas').click()
   await page.getByRole('button', { name: 'Carregar exemplo' }).click()
   await expect(page.getByRole('cell', { name: 'Maré de Pedra' })).toBeVisible()
   await expect(page.getByRole('cell', { name: 'B0CLOUD001' })).toBeVisible()

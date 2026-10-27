@@ -99,9 +99,9 @@ export async function cloudImportCookies(header: string, region: string) {
   return invoke<Snapshot>('library_snapshot')
 }
 
-export async function cloudSync() {
+export async function cloudSync(region?: string) {
   if (!inTauri()) return mock.cloudLoadExample()
-  return invoke<Snapshot>('cloud_sync')
+  return invoke<Snapshot>('cloud_sync', { region })
 }
 
 export async function cloudSyncBook(asin: string) {
@@ -114,9 +114,14 @@ export async function cloudLoadExample() {
   return invoke<Snapshot>('cloud_load_example')
 }
 
-export async function cloudOpenReader(asin: string) {
+export async function cloudOpenReader(asin: string, title?: string) {
   if (!inTauri()) return
-  await invoke('cloud_open_reader', { asin })
+  await invoke('cloud_open_reader', { asin, title })
+}
+
+export async function cloudCloseReader() {
+  if (!inTauri()) return
+  await invoke('cloud_close_reader')
 }
 
 export async function setFullscreen(enabled: boolean) {

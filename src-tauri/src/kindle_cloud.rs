@@ -409,7 +409,7 @@ fn book_from_item(item: &Value, region: Region) -> Option<OwnedBook> {
     }
     let title = first_string(item, &["title", "productTitle"]).unwrap_or_else(|| asin.clone());
     let author = authors_of(item);
-    let cover_url = first_string(item, &["coverUrl", "imageUrl", "productImage"]).unwrap_or_default();
+    let cover_url = cover_of(item);
     let percentage = percentage_field(item);
     let reader = first_string(item, &["webReaderUrl", "readerUrl"])
         .filter(|url| url.starts_with("http"))
@@ -425,15 +425,100 @@ fn book_from_item(item: &Value, region: Region) -> Option<OwnedBook> {
 }
 
 fn authors_of(item: &Value) -> String {
-    match item.get("authors").or_else(|| item.get("author")) {
-        Some(Value::String(value)) => value.clone(),
+    let names = match item.get("authors").or_else(|| item.get("author")) {
+        Some(Value::String(value)) => vec![clean_author(value)],
         Some(Value::Array(list)) => list
             .iter()
             .filter_map(|entry| entry.as_str().or_else(|| entry.get("name").and_then(|name| name.as_str())))
-            .collect::<Vec<_>>()
-            .join(", "),
-        _ => "Autor desconhecido".into(),
+            .map(clean_author)
+            .filter(|name| !name.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        "Autor desconhecido".into()
+    } else {
+        names.join(", ")
     }
+}
+
+fn clean_author(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches(':').trim();
+    let primary = if trimmed.contains(':') {
+        trimmed
+            .split(':')
+            .map(str::trim)
+            .find(|part| !part.is_empty())
+            .unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let primary = primary.trim().trim_end_matches(':').trim();
+    flip_last_first(primary)
+}
+
+fn flip_last_first(name: &str) -> String {
+    let Some((last, first)) = name.split_once(',') else {
+        return name.trim().to_string();
+    };
+    if first.contains(',') {
+        return name.trim().to_string();
+    }
+    let last = last.trim();
+    let first = first.trim().trim_end_matches(':').trim();
+    if first.is_empty() || last.is_empty() {
+        return name.trim().to_string();
+    }
+    format!("{first} {last}")
+}
+
+fn cover_of(item: &Value) -> String {
+    for key in ["productUrl", "coverUrl", "imageUrl", "productImage", "largeCoverUrl", "thumbUrl"] {
+        let Some(value) = item.get(key).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if key == "productUrl" && !looks_like_cover(value) {
+            continue;
+        }
+        return upgrade_cover(value);
+    }
+    String::new()
+}
+
+fn looks_like_cover(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("media-amazon.com")
+        || lower.contains("ssl-images-amazon.com")
+        || lower.contains("images-amazon.com")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".webp")
+}
+
+fn upgrade_cover(url: &str) -> String {
+    let Some(marker) = url.find("._") else {
+        return url.to_string();
+    };
+    let rest = &url[marker + 2..];
+    let Some(end) = rest.find('_') else {
+        return url.to_string();
+    };
+    let token = &rest[..end];
+    let digits: String = token.chars().filter(|char| char.is_ascii_digit()).collect();
+    let Ok(size) = digits.parse::<u32>() else {
+        return url.to_string();
+    };
+    let kind = token.trim_end_matches(|char: char| char.is_ascii_digit());
+    if size < 600 && matches!(kind, "SY" | "SX" | "SL" | "SS" | "US" | "UL") {
+        let suffix = &rest[end + 1..];
+        return format!("{}._SL800_{suffix}", &url[..marker]);
+    }
+    url.to_string()
 }
 
 fn percentage_field(item: &Value) -> f64 {
@@ -590,5 +675,42 @@ mod tests {
         assert!(start_reading_url(Region::Us, "B0CLOUD001").contains("read.amazon.com"));
         assert!(annotations_url(Region::Br).contains("getAnnotations"));
         assert!(owned_content_url(Region::Br, "B0CLOUD001").contains("getOwnedContent"));
+    }
+
+    #[test]
+    fn real_brazil_library_has_covers_and_clean_authors() {
+        let body = include_str!("../fixtures/amazon-br-library.json");
+        assert_library_authors_and_covers(body);
+        if let Ok(live) = std::fs::read_to_string("/cursor/stores/bot/real-amazon-br-library.json") {
+            assert_library_authors_and_covers(&live);
+        }
+    }
+
+    fn assert_library_authors_and_covers(body: &str) {
+        let (books, _) = parse_library_document(body, Region::Br).expect("biblioteca");
+        assert_eq!(books.len(), 10);
+        let expected = [
+            ("B084RMWS4D", "Arthur Schopenhauer"),
+            ("B0GX3FDWTX", "Homero de Esmirna"),
+            ("B088GVJXTN", "Santo Agostinho"),
+            ("B0BY15WKL4", "Fiódor Dostoiévski"),
+            ("B07522WHGC", "Robert Greene"),
+            ("B0HFPXM52X", "Tech Cert Academy"),
+            ("B091BD2MJ9", "Caio Costa"),
+            ("B08B81415B", "Fiódor Dostoiévski"),
+            ("B08NYZRF16", "Robert W. Chambers"),
+            ("B09Z8K9MYQ", "Yogesh Mali"),
+        ];
+        for (asin, author) in expected {
+            let book = books.iter().find(|book| book.asin == asin).unwrap_or_else(|| panic!("{asin}"));
+            assert_eq!(book.author, author, "{}", book.title);
+            assert!(!book.author.contains(':'), "{}", book.author);
+            assert!(
+                book.cover_url.starts_with("https://m.media-amazon.com/"),
+                "{}",
+                book.cover_url
+            );
+            assert!(!book.cover_url.is_empty());
+        }
     }
 }

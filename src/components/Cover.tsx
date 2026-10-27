@@ -13,7 +13,7 @@ export function Cover({ book }: { book: Book }) {
   return (
     <div className="cover">
       {book.cover ? (
-        <img src={book.cover} alt="" />
+        <img src={book.cover} alt="" referrerPolicy="no-referrer" loading="lazy" />
       ) : (
         <div className="cover-type" style={{ background: tone(book.title) }}>
           <strong>{book.title}</strong>
