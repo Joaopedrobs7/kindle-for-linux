@@ -1,0 +1,15 @@
+Package: kindle-para-linux
+Version: 2.0.0
+Architecture: amd64
+Maintainer: kindlelinux
+Installed-Size: 15675
+Depends: libwebkit2gtk-4.1-0, libgtk-3-0
+Filename: ./kindle-para-linux_2.0.0_amd64.deb
+Size: 6719218
+MD5sum: 427e3339b3dca697380985b4273eba13
+SHA1: 7541c5904563885a9b98e551043dd433fc16e149
+SHA256: f1dbe18c532767cba5e1eaeec7e4b81269853839313f271bfbacd99e4ad6a330
+Priority: optional
+Description: Estante Kindle e leitor EPUB no Linux
+ Cliente não oficial com a biblioteca Kindle Cloud e um leitor EPUB na mesma estante.
+

@@ -1,0 +1,20 @@
+Architectures: amd64
+Codename: stable
+Components: main
+Date: Tue, 27 Oct 2026 22:48:57 +0000
+Description: Repositório APT do Kindle para Linux
+Label: Kindle para Linux
+Origin: Kindle para Linux
+Suite: stable
+MD5Sum:
+ b356cafa29e19517bcea2fe9484f7c80              528 Packages
+ 8d1956da94805ed60cc949d56dadd698              385 Packages.gz
+SHA1:
+ 48a3d95f915d754251c19a74399f275797ed2290              528 Packages
+ bd68da2d64b49bd9b40803bafc7fc8c217f36efe              385 Packages.gz
+SHA256:
+ abfdf2ba6131141b1bd4bb76425e8c58f99785770312676c0c0afa505787ce85              528 Packages
+ 5e480cb51b0b2aea3a5b3346c51d5618648b7388e949dcc537659b88dd82b9fb              385 Packages.gz
+SHA512:
+ 2b6984ace6b684da6faba9089cadbafa17a9d9190b7b9bdbfe9c8308c9a1b4997b0f9385b31eef573b972973cd3d2458f1d5ff44c88ce658c3b683e54dd3cb0f              528 Packages
+ 5c196139f5e506ce11de15fe6a529476d636d3c7202389a2b216e81387a9525ab7fcde0f5031ef1b21e69b963bb8b4044f8bb9de7ca0ded5d47a55b9c8793198              385 Packages.gz
