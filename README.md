@@ -2,16 +2,14 @@
 
 ## Instalação rápida (Ubuntu / Debian)
 
-Um comando baixa o pacote publicado e instala o **Kindle para Linux**:
+Um comando baixa o pacote publicado e instala o **Kindle para Linux**. O script é POSIX `sh` e chama `sudo` sozinho:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Joaopedrobs7/kindle-for-linux/main/install.sh | sudo bash
+```sh
+curl -fsSL https://joaopedrobs7.github.io/kindle-for-linux/install.sh | sh
 ```
 
-O mesmo instalador está no GitHub Pages:
-
-```bash
-curl -fsSL https://joaopedrobs7.github.io/kindle-for-linux/install.sh | sudo bash
+```sh
+curl -fsSL https://raw.githubusercontent.com/Joaopedrobs7/kindle-for-linux/main/install.sh | sh
 ```
 
 Quando o repositório APT responde, o script grava `/etc/apt/sources.list.d/kindle-linux.list`. A partir daí o apt instala e atualiza o pacote:
