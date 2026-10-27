@@ -1,0 +1,23 @@
+{
+  "asin": "B0CLOUD001",
+  "annotations": [
+    {
+      "type": "highlight",
+      "start": 120,
+      "end": 148,
+      "highlight": "O faroleiro não salva o mar.",
+      "note": "frase do diário",
+      "color": "yellow",
+      "creationTime": 1730000001000
+    },
+    {
+      "type": "note",
+      "start": 300,
+      "end": 320,
+      "content": "reserva amarela",
+      "note": "lembrar o lampião",
+      "color": "blue",
+      "creationTime": 1730000002000
+    }
+  ]
+}

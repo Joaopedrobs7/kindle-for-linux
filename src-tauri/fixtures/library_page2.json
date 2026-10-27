@@ -1,0 +1,20 @@
+{
+  "items": [
+    {
+      "asin": "B0CLOUD003",
+      "title": "Casa de Chá",
+      "authors": ["Lina Ortega"],
+      "percentageRead": 0,
+      "webReaderUrl": "https://ler.amazon.com.br/?asin=B0CLOUD003",
+      "resourceType": "EBOOK"
+    },
+    {
+      "asin": "B0CLOUD001",
+      "title": "Maré de Pedra",
+      "authors": ["Helena Vilar"],
+      "percentageRead": 42,
+      "resourceType": "EBOOK"
+    }
+  ],
+  "paginationToken": null
+}

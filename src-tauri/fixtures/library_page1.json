@@ -1,0 +1,22 @@
+{
+  "itemsList": [
+    {
+      "asin": "B0CLOUD001",
+      "title": "Maré de Pedra",
+      "authors": ["Helena Vilar"],
+      "percentageRead": 42,
+      "productUrl": "/dp/B0CLOUD001",
+      "coverUrl": "",
+      "resourceType": "EBOOK"
+    },
+    {
+      "asin": "B0CLOUD002",
+      "title": "O Caderno Azul",
+      "authors": "Nuno Pires",
+      "percentageRead": 7,
+      "productUrl": "https://ler.amazon.com.br/dp/B0CLOUD002",
+      "resourceType": "EBOOK"
+    }
+  ],
+  "paginationToken": "page-2"
+}

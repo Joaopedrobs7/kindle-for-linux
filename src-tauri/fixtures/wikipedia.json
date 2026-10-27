@@ -1,0 +1,7 @@
+{
+  "title": "Farol",
+  "extract": "Um farol é uma torre com um facho de luz que avisa o navegante.",
+  "content_urls": {
+    "desktop": { "page": "https://pt.wikipedia.org/wiki/Farol" }
+  }
+}

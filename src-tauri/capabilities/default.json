@@ -1,0 +1,14 @@
+{
+  "identifier": "default",
+  "description": "Janela principal",
+  "windows": ["main", "amazon-login", "cloud-reader"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-close",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:webview:allow-create-webview-window",
+    "core:event:default"
+  ]
+}
