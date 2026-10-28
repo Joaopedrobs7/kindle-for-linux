@@ -605,7 +605,7 @@ fn urlencoding(value: &str) -> String {
 }
 
 pub const READER_QUIET_CSS: &str = r#"
-.top-chrome__back-button, #kindleReaderHeader, #kindle_menu, #navbar, #navBar,
+#kindleReaderHeader, #kindle_menu, #navbar, #navBar,
 .a-navbar, #nav-belt, #navbar-main { visibility: hidden !important; }
 body { background: #F7F5F0 !important; }
 "#;

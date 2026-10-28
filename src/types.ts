@@ -7,6 +7,7 @@ export interface ReaderPrefs {
   measure: number
   align: string
   flow: string
+  columns?: number
 }
 
 export interface Settings {

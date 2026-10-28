@@ -14,10 +14,10 @@
       {
         "label": "main",
         "title": "Kindle para Linux",
-        "width": 1240,
-        "height": 820,
-        "minWidth": 880,
-        "minHeight": 620,
+        "width": 960,
+        "height": 600,
+        "minWidth": 420,
+        "minHeight": 400,
         "resizable": true
       }
     ],

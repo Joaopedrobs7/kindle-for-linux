@@ -69,7 +69,8 @@ export function useEpub({
           width: host.clientWidth,
           height: host.clientHeight,
           flow: prefsRef.current.flow === 'scrolled' ? 'scrolled' : 'paginated',
-          spread: 'none',
+          spread: prefsRef.current.columns === 1 ? 'none' : 'auto',
+          minSpreadWidth: 720,
           manager: prefsRef.current.flow === 'scrolled' ? 'continuous' : 'default',
           allowScriptedContent: false,
         })
@@ -133,7 +134,7 @@ export function useEpub({
       renditionRef.current = null
       bookRef.current = null
     }
-  }, [bookId, data, prefs.flow])
+  }, [bookId, data, prefs.flow, prefs.columns])
 
   useEffect(() => {
     const rendition = renditionRef.current

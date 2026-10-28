@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn default_columns() -> u16 {
+    2
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReaderPrefs {
@@ -11,6 +15,8 @@ pub struct ReaderPrefs {
     pub measure: u16,
     pub align: String,
     pub flow: String,
+    #[serde(default = "default_columns")]
+    pub columns: u16,
 }
 
 impl Default for ReaderPrefs {
@@ -24,6 +30,7 @@ impl Default for ReaderPrefs {
             measure: 68,
             align: "justify".into(),
             flow: "paginated".into(),
+            columns: default_columns(),
         }
     }
 }

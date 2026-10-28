@@ -10,6 +10,7 @@ const reader = {
   measure: 68,
   align: 'justify',
   flow: 'paginated',
+  columns: 2,
 }
 
 const settings: Settings = { appearance: 'paper', region: 'br', reader: { ...reader } }

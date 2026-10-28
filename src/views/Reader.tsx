@@ -194,7 +194,7 @@ export function Reader({
   return (
     <section className="reader" data-testid="reader" data-theme={prefs.theme} style={{ background: theme.bg, color: theme.fg }}>
       <header className="reader-chrome top">
-        <button type="button" onClick={onBack} aria-label="Voltar à estante">Estante</button>
+        <button type="button" onClick={onBack} aria-label="Voltar à Biblioteca">← Biblioteca</button>
         <div className="reader-title">
           <strong>{title}</strong>
           <span>{reader.chapterTitle || author}</span>
@@ -288,6 +288,8 @@ export function Reader({
                   <button type="button" aria-pressed={prefs.align === 'left'} onClick={() => onPrefs({ align: 'left' })}>À esquerda</button>
                   <button type="button" aria-pressed={prefs.flow === 'paginated'} onClick={() => onPrefs({ flow: 'paginated' })}>Páginas</button>
                   <button type="button" aria-pressed={prefs.flow === 'scrolled'} onClick={() => onPrefs({ flow: 'scrolled' })}>Rolo</button>
+                  <button type="button" aria-pressed={prefs.columns === 1} onClick={() => onPrefs({ columns: 1 })}>1 coluna</button>
+                  <button type="button" aria-pressed={prefs.columns !== 1} onClick={() => onPrefs({ columns: 2 })}>2 colunas</button>
                 </div>
               </>
             )}

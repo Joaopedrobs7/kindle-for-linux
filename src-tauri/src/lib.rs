@@ -279,10 +279,17 @@ fn cloud_open_reader(app: AppHandle, asin: String, title: Option<String>) -> Res
         let _ = main_wv.hide();
     }
     let window = app.get_window("main").ok_or_else(|| "Janela principal ausente".to_string())?;
-    let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
-    let physical = window.inner_size().map_err(|error| error.to_string())?;
-    let width = physical.width as f64 / scale;
-    let full_height = physical.height as f64 / scale;
+    // Linux packs the child into a GtkBox. add_child's size becomes a GTK
+    // size_request, which would stop the window from shrinking or tiling.
+    // A small request lets expand+fill follow the real allocation.
+    #[cfg(target_os = "linux")]
+    let child_size = LogicalSize::new(200.0, 200.0);
+    #[cfg(not(target_os = "linux"))]
+    let child_size = {
+        let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
+        let physical = window.inner_size().map_err(|error| error.to_string())?;
+        LogicalSize::new(physical.width as f64 / scale, physical.height as f64 / scale)
+    };
     let target = reader_url(region, &asin);
     let reader: url::Url = target.parse().map_err(|error: url::ParseError| error.to_string())?;
     let blank: url::Url = "about:blank".parse().map_err(|error: url::ParseError| error.to_string())?;
@@ -302,7 +309,7 @@ fn cloud_open_reader(app: AppHandle, asin: String, title: Option<String>) -> Res
             true
         });
     let webview = window
-        .add_child(builder, LogicalPosition::new(0.0, 0.0), LogicalSize::new(width, full_height))
+        .add_child(builder, LogicalPosition::new(0.0, 0.0), child_size)
         .map_err(|error| error.to_string())?;
     push_session_cookies(&webview, &session);
     let _ = webview.navigate(reader);
@@ -489,7 +496,7 @@ fn push_session_cookies(webview: &tauri::Webview, session: &StoredSession) {
 
 fn reader_init_script() -> String {
     let css = format!(
-        "{READER_QUIET_CSS}\n#kl-back{{position:fixed;top:12px;left:16px;z-index:2147483647;background:#F6F3EC;color:#141413;border:1px solid #d8d2c6;border-radius:6px;padding:9px 16px;font:600 13px/1 system-ui,sans-serif;cursor:pointer;}}"
+        "{READER_QUIET_CSS}\n#kl-back{{position:fixed;top:12px;left:16px;z-index:2147483647;background:transparent;color:inherit;border:1px solid rgba(128,128,128,0.35);border-radius:999px;padding:7px 14px;font:500 13px/1 -apple-system,BlinkMacSystemFont,\"Helvetica Neue\",Roboto,sans-serif;cursor:pointer;backdrop-filter:blur(6px);}}"
     );
     let css = serde_json::to_string(&css).unwrap_or_else(|_| "\"\"".into());
     r#"(function(){
@@ -506,6 +513,36 @@ const goHome = () => {
   } catch (e) {}
   window.location.replace('/kindle-library#kl-close');
 };
+const rewriteText = (root) => {
+  if (!root) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (node.nodeValue && node.nodeValue.indexOf('Kindle Library') !== -1) {
+      node.nodeValue = node.nodeValue.replace('Kindle Library', 'Biblioteca');
+    }
+  }
+  const elements = root.querySelectorAll ? root.querySelectorAll('*') : [];
+  elements.forEach((el) => {
+    if (el.shadowRoot) rewriteText(el.shadowRoot);
+  });
+};
+const bindNative = (host) => {
+  host.setAttribute('title', 'Voltar à Biblioteca');
+  host.setAttribute('aria-label', 'Voltar à Biblioteca');
+  host.querySelectorAll('ion-button, button, a').forEach((el) => {
+    el.setAttribute('title', 'Voltar à Biblioteca');
+    el.setAttribute('aria-label', 'Voltar à Biblioteca');
+  });
+  rewriteText(host);
+  if (host.dataset.klBound === '1') return;
+  host.dataset.klBound = '1';
+  host.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    goHome();
+  }, true);
+};
 const mount = () => {
   const root = document.documentElement;
   if (!root) return;
@@ -516,18 +553,26 @@ const mount = () => {
     root.appendChild(s);
   }
   if (s.textContent !== css) s.textContent = css;
-  if (!document.getElementById('kl-back')) {
-    const b = document.createElement('button');
-    b.id = 'kl-back';
-    b.type = 'button';
-    b.textContent = '← Biblioteca';
-    b.addEventListener('click', (event) => {
+  const native = document.querySelector('.top-chrome__back-button');
+  let fallback = document.getElementById('kl-back');
+  if (native) {
+    bindNative(native);
+    if (fallback) fallback.style.setProperty('display', 'none', 'important');
+    return;
+  }
+  if (!fallback) {
+    fallback = document.createElement('button');
+    fallback.id = 'kl-back';
+    fallback.type = 'button';
+    fallback.textContent = '← Biblioteca';
+    fallback.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
       goHome();
     });
-    root.appendChild(b);
+    root.appendChild(fallback);
   }
+  fallback.style.removeProperty('display');
 };
 const onKey = (event) => {
   if (event.key === 'Escape') {
@@ -537,7 +582,8 @@ const onKey = (event) => {
 };
 window.addEventListener('click', (event) => {
   const button = document.getElementById('kl-back');
-  if (!button) return;
+  if (!button || button.style.display === 'none') return;
+  if (document.querySelector('.top-chrome__back-button')) return;
   const rect = button.getBoundingClientRect();
   const inside = event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
   if (event.target === button || button.contains(event.target) || inside) {
@@ -550,7 +596,7 @@ window.addEventListener('keydown', onKey, true);
 document.addEventListener('keydown', onKey, true);
 const boot = () => {
   mount();
-  if (document.documentElement) new MutationObserver(mount).observe(document.documentElement, {childList:true});
+  if (document.documentElement) new MutationObserver(mount).observe(document.documentElement, {childList:true, subtree:true});
 };
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
@@ -559,17 +605,24 @@ else boot();
 }
 
 fn resize_cloud_reader(app: &AppHandle, size: PhysicalSize<u32>) {
-    let Some(webview) = app.get_webview("cloud-reader") else {
-        return;
-    };
-    let Some(window) = app.get_window("main") else {
-        return;
-    };
-    let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
-    let width = (size.width as f64 / scale).max(320.0);
-    let height = (size.height as f64 / scale).max(240.0);
-    let _ = webview.set_position(LogicalPosition::new(0.0, 0.0));
-    let _ = webview.set_size(LogicalSize::new(width, height));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Some(webview) = app.get_webview("cloud-reader") else {
+            return;
+        };
+        let Some(window) = app.get_window("main") else {
+            return;
+        };
+        let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
+        let width = (size.width as f64 / scale).max(320.0);
+        let height = (size.height as f64 / scale).max(240.0);
+        let _ = webview.set_position(LogicalPosition::new(0.0, 0.0));
+        let _ = webview.set_size(LogicalSize::new(width, height));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (app, size);
+    }
 }
 
 fn material_from(session: &StoredSession) -> Result<SessionMaterial, String> {
@@ -591,7 +644,7 @@ fn open_amazon_window(app: &AppHandle, label: &str, title: &str, target: &str, s
     let url = target.parse().map_err(|error: url::ParseError| error.to_string())?;
     let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
         .title(title)
-        .inner_size(1100.0, 760.0)
+        .inner_size(920.0, 580.0)
         .user_agent(kindle_cloud::CHROME_UA)
         .initialization_script("if (!window.chrome) { window.chrome = { runtime: {} }; }");
     if !script.is_empty() {
@@ -621,9 +674,16 @@ mod tests {
         let script = reader_init_script();
         assert!(script.contains("cloud_close_reader"));
         assert!(script.contains("← Biblioteca"));
+        assert!(script.contains("Kindle Library"));
+        assert!(script.contains("Voltar à Biblioteca"));
         assert!(script.contains("/kindle-library#kl-close"));
         assert!(script.contains("Escape"));
         assert!(script.contains(".top-chrome__back-button"));
+        assert!(script.contains("display', 'none', 'important'"));
+        assert!(script.contains("border-radius:999px"));
+        assert!(script.contains("background:transparent"));
+        assert!(!script.contains("background:#F6F3EC"));
+        assert!(!script.contains(".top-chrome__back-button,"));
         assert!(script.contains("#kindleReaderHeader"));
         assert!(!script.contains("#reader-header"));
         let mut depth = 0i32;
