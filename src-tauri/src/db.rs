@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection};
 
 use crate::epub_meta::read_epub_meta;
-use crate::kindle_cloud::{CloudAnnotation, OwnedBook, ReadingPosition};
+use crate::kindle_cloud::{clean_title, decode_html_entities, CloudAnnotation, OwnedBook, ReadingPosition};
 use crate::model::{
     Book, Bookmark, BookmarkInput, Highlight, HighlightInput, ProgressInput, SessionStatus, Settings, Snapshot,
     StoredSession,
@@ -78,7 +78,57 @@ impl Db {
                 .collect::<Vec<_>>();
             db.save_folders(&folders)?;
         }
+        if let Ok(mut existing) = db.folders() {
+            let mut changed = false;
+            for def in default_folders() {
+                let s = def.display().to_string();
+                if !existing.contains(&s) {
+                    existing.push(s);
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = db.save_folders(&existing);
+            }
+        }
+        let _ = db.clean_existing_titles();
         Ok(db)
+    }
+
+    fn clean_existing_titles(&self) -> Result<(), String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, title, author FROM books")
+            .map_err(|error| error.to_string())?;
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        for (id, title, author) in rows {
+            let cleaned_title = clean_title(&title);
+            let cleaned_author = decode_html_entities(&author);
+            if cleaned_title != title || cleaned_author != author {
+                let _ = self.conn.execute(
+                    "UPDATE books SET title = ?1, author = ?2 WHERE id = ?3",
+                    params![cleaned_title, cleaned_author, id],
+                );
+            }
+        }
+        let _ = self.dedup_pdocs_against_local();
+        Ok(())
+    }
+
+    fn dedup_pdocs_against_local(&self) -> Result<(), String> {
+        let locals = self.books()?;
+        let local_books: Vec<&Book> = locals.iter().filter(|b| b.source == "local" && !b.missing).collect();
+        let cloud_pdocs: Vec<&Book> = locals.iter().filter(|b| b.source == "cloud" && b.asin.len() > 12).collect();
+        for pdoc in cloud_pdocs {
+            if local_books.iter().any(|loc| titles_match_local_and_pdoc(&loc.title, &loc.file_path, &pdoc.title)) {
+                let _ = self.conn.execute("DELETE FROM books WHERE id = ?1", [&pdoc.id]);
+            }
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self) -> Result<Snapshot, String> {
@@ -145,7 +195,23 @@ impl Db {
 
     pub fn upsert_cloud(&self, books: &[OwnedBook]) -> Result<(), String> {
         let now = now_ms();
+        let existing_locals: Vec<Book> = self
+            .books()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|b| b.source == "local" && !b.missing)
+            .collect();
         for book in books {
+            let title = clean_title(&book.title);
+            if book.asin.len() > 12
+                && existing_locals
+                    .iter()
+                    .any(|loc| titles_match_local_and_pdoc(&loc.title, &loc.file_path, &title))
+            {
+                let id = format!("cloud:{}", book.asin);
+                let _ = self.conn.execute("DELETE FROM books WHERE id = ?1", [&id]);
+                continue;
+            }
             let id = format!("cloud:{}", book.asin);
             self.conn
                 .execute(
@@ -155,9 +221,9 @@ impl Db {
                        title = excluded.title,
                        author = excluded.author,
                        cover = CASE WHEN excluded.cover = '' THEN books.cover ELSE excluded.cover END,
-                       percent_read = excluded.percent_read,
+                       percent_read = CASE WHEN excluded.percent_read > 0.0 THEN excluded.percent_read ELSE books.percent_read END,
                        missing = 0",
-                    params![id, book.asin, book.title, book.author, book.cover_url, book.percentage, now],
+                    params![id, book.asin, title, book.author, book.cover_url, book.percentage, now],
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -344,6 +410,7 @@ impl Db {
 
     fn upsert_local(&self, path: &Path) -> Result<bool, String> {
         let meta = read_epub_meta(path)?;
+        let clean_meta_title = clean_title(&meta.title);
         let id = format!("local:{}", path.display());
         let existed: i64 = self
             .conn
@@ -358,9 +425,10 @@ impl Db {
                    author = excluded.author,
                    cover = excluded.cover,
                    missing = 0",
-                params![id, meta.title, meta.author, path.display().to_string(), meta.cover_data_url, now_ms()],
+                params![id, clean_meta_title, meta.author, path.display().to_string(), meta.cover_data_url, now_ms()],
             )
             .map_err(|error| error.to_string())?;
+        let _ = self.dedup_pdocs_against_local();
         Ok(existed == 0)
     }
 
@@ -486,7 +554,11 @@ impl Db {
 pub fn default_folders() -> Vec<PathBuf> {
     let mut folders = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
-        folders.push(PathBuf::from(home).join("Documents/Kindle"));
+        let base = PathBuf::from(home);
+        folders.push(base.join("Documents/Kindle"));
+        folders.push(base.join("Downloads"));
+        folders.push(base.join("Documents"));
+        folders.push(base.join("Documentos"));
     }
     folders.push(PathBuf::from("/workspace/kindle"));
     folders
@@ -514,6 +586,33 @@ fn collect_epubs(dir: &Path, found: &mut Vec<PathBuf>, depth: u8) {
             found.push(path);
         }
     }
+}
+
+
+fn normalize_slug(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+fn titles_match_local_and_pdoc(local_title: &str, file_path: &str, pdoc_title: &str) -> bool {
+    let p_slug = normalize_slug(pdoc_title);
+    if p_slug.len() < 5 {
+        return false;
+    }
+    let l_slug = normalize_slug(local_title);
+    if l_slug == p_slug || l_slug.starts_with(&p_slug) || p_slug.starts_with(&l_slug) {
+        return true;
+    }
+    if let Some(stem) = Path::new(file_path).file_stem().and_then(|s| s.to_str()) {
+        let s_slug = normalize_slug(stem.trim_end_matches("-kindle"));
+        if !s_slug.is_empty() && (s_slug == p_slug || s_slug.starts_with(&p_slug) || p_slug.starts_with(&s_slug)) {
+            return true;
+        }
+    }
+    false
 }
 
 fn now_ms() -> i64 {

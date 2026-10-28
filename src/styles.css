@@ -83,8 +83,9 @@ main { flex: 1; min-width: 0; overflow: auto; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 28px 22px; }
 .card { display: flex; flex-direction: column; gap: 8px; }
 .cover-hit { padding: 0; border: 0; background: transparent; text-align: left; }
-.card-meta h2 { font-family: Literata, serif; font-size: 16px; font-weight: 500; margin: 8px 0 0; line-height: 1.25; }
+.card-meta h2 { font-family: Literata, serif; font-size: 16px; font-weight: 500; margin: 8px 0 0; line-height: 1.25; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis; }
 .card-meta p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+.card-meta > p:not(.meta-line) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .meta-line { display: flex; justify-content: space-between; gap: 8px; font-variant-numeric: tabular-nums; font-size: 12px; }
 .asin { font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: 0.02em; }
 

@@ -60,7 +60,7 @@ fn cover_data_url(archive: &mut ZipArchive<File>, opf: &str, opf_path: &str) -> 
     let Ok(mut entry) = archive.by_name(&name) else {
         return String::new();
     };
-    if entry.size() > 450_000 {
+    if entry.size() > 4_500_000 {
         return String::new();
     }
     let mut bytes = Vec::new();
@@ -101,6 +101,11 @@ fn cover_href(opf: &str) -> Option<String> {
     Regex::new(r#"<item[^>]*properties\s*=\s*"cover-image"[^>]*href\s*=\s*"([^"]+)""#)
         .ok()?
         .captures(opf)
+        .or_else(|| {
+            Regex::new(r#"<item[^>]*href\s*=\s*"([^"]+)"[^>]*properties\s*=\s*"cover-image""#)
+                .ok()?
+                .captures(opf)
+        })
         .and_then(|cap| cap.get(1).map(|item| item.as_str().to_string()))
 }
 

@@ -68,10 +68,10 @@ export function Shelf({
                 <Cover book={book} />
               </button>
               <div className="card-meta">
-                <h2>{book.title}</h2>
+                <h2 title={book.title}>{book.title}</h2>
                 <p>{book.author}</p>
                 <p className="meta-line">
-                  {book.source === 'cloud' ? <span className="asin">{book.asin}</span> : <span>EPUB</span>}
+                  {book.source === 'cloud' ? <span className="asin">{book.asin.length > 12 ? 'DOC' : book.asin}</span> : <span>EPUB</span>}
                   <span>{Math.round(book.percentage * 100)}%</span>
                 </p>
               </div>
@@ -86,10 +86,10 @@ export function Shelf({
               <button type="button" onClick={() => onOpen(book)} aria-label={`Abrir ${book.title}`}>
                 <Cover book={book} />
                 <span>
-                  <strong>{book.title}</strong>
+                  <strong title={book.title}>{book.title}</strong>
                   <em>{book.author}</em>
                 </span>
-                <span className="meta-line">{book.asin || 'EPUB'} · {Math.round(book.percentage * 100)}%</span>
+                <span className="meta-line">{book.asin ? (book.asin.length > 12 ? 'DOC' : book.asin) : 'EPUB'} · {Math.round(book.percentage * 100)}%</span>
               </button>
             </li>
           ))}

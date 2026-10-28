@@ -25,6 +25,7 @@ use crate::model::{BookmarkInput, HighlightInput, ProgressInput, Settings, Store
 
 struct AppState {
     db: Mutex<Db>,
+    active_cloud_asin: Mutex<String>,
 }
 
 #[tauri::command]
@@ -264,6 +265,9 @@ fn cloud_open_reader(app: AppHandle, asin: String, title: Option<String>) -> Res
     let _ = title;
     let (region, session) = {
         let state = app.state::<AppState>();
+        if let Ok(mut active) = state.active_cloud_asin.lock() {
+            *active = asin.clone();
+        }
         let db = state.db.lock().map_err(|error| error.to_string())?;
         let session = db.session()?;
         (Region::parse(&session.region), session)
@@ -319,6 +323,10 @@ fn cloud_open_reader(app: AppHandle, asin: String, title: Option<String>) -> Res
 }
 
 fn close_cloud_reader_internal(app: &AppHandle) {
+    let asin = app
+        .try_state::<AppState>()
+        .and_then(|state| state.active_cloud_asin.lock().ok().map(|mut a| std::mem::take(&mut *a)))
+        .unwrap_or_default();
     if let Some(main_wv) = app.get_webview("main") {
         let _ = main_wv.show();
         let _ = main_wv.set_focus();
@@ -327,6 +335,27 @@ fn close_cloud_reader_internal(app: &AppHandle) {
         let _ = webview.close();
     }
     let _ = app.emit("cloud-reader-closed", ());
+    if !asin.is_empty() {
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let material = {
+                let Some(state) = handle.try_state::<AppState>() else { return };
+                let Ok(db) = state.db.lock() else { return };
+                let Ok(sess) = db.session() else { return };
+                let Ok(mat) = material_from(&sess) else { return };
+                mat
+            };
+            if let Ok(pos) = fetch_position(&material, &asin).await {
+                if let Some(state) = handle.try_state::<AppState>() {
+                    if let Ok(db) = state.db.lock() {
+                        let _ = db.set_cloud_progress(&pos);
+                    }
+                }
+                let _ = handle.emit("library-changed", ());
+            }
+        });
+    }
 }
 
 fn spawn_reader_close_watcher(app: AppHandle) {
@@ -707,7 +736,7 @@ pub fn run() {
             fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
             let db = Db::open(&dir.join("library.db")).map_err(|error| error.to_string())?;
             let _ = db.scan();
-            app.manage(AppState { db: Mutex::new(db) });
+            app.manage(AppState { db: Mutex::new(db), active_cloud_asin: Mutex::new(String::new()) });
             if let Some(window) = app.get_window("main") {
                 let resized = app.handle().clone();
                 window.on_window_event(move |event| {

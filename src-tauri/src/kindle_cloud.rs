@@ -53,6 +53,13 @@ impl Region {
         }
     }
 
+    pub fn store_origin(self) -> &'static str {
+        match self {
+            Self::Br => "https://www.amazon.com.br",
+            Self::Us => "https://www.amazon.com",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Br => "br",
@@ -214,7 +221,9 @@ pub fn parse_library_document(body: &str, region: Region) -> Result<(Vec<OwnedBo
     let mut books = Vec::new();
     for item in items {
         if let Some(book) = book_from_item(item, region) {
-            books.push(book);
+            if !books.iter().any(|existing: &OwnedBook| existing.title.eq_ignore_ascii_case(&book.title)) {
+                books.push(book);
+            }
         }
     }
     if books.is_empty() {
@@ -326,19 +335,37 @@ pub async fn fetch_library(session: &SessionMaterial) -> Result<Vec<OwnedBook>, 
     let mut pages = Vec::new();
     for _ in 0..20 {
         let url = library_search_url(session.region, token.as_deref());
-        let body = send_get(&client, session, &url).await?;
-        let (books, next) = parse_library_document(&body, session.region)?;
-        pages.push(books);
-        match next {
-            Some(value) => token = Some(value),
-            None => break,
+        match send_get(&client, session, &url).await.and_then(|body| parse_library_document(&body, session.region)) {
+            Ok((books, next)) => {
+                pages.push(books);
+                match next {
+                    Some(value) => token = Some(value),
+                    None => break,
+                }
+            }
+            Err(err) => {
+                if pages.is_empty() {
+                    return Err(err);
+                }
+                break;
+            }
         }
     }
-    Ok(merge_pages(&pages))
+    if let Ok(pdocs) = fetch_pdocs(&client, session).await {
+        if !pdocs.is_empty() {
+            pages.push(pdocs);
+        }
+    }
+    let mut merged = merge_pages(&pages);
+    hydrate_library_progress(&client, session, &mut merged).await;
+    Ok(merged)
 }
 
 pub async fn fetch_position(session: &SessionMaterial, asin: &str) -> Result<ReadingPosition, CloudError> {
     let client = http_client()?;
+    if let Some(pos) = fetch_reader_progress(&client, session, asin).await {
+        return Ok(pos);
+    }
     let url = start_reading_url(session.region, asin);
     let body = send_get(&client, session, &url).await?;
     let mut position = parse_reading_position(&body)?;
@@ -346,6 +373,195 @@ pub async fn fetch_position(session: &SessionMaterial, asin: &str) -> Result<Rea
         position.asin = asin.to_string();
     }
     Ok(position)
+}
+
+async fn hydrate_library_progress(client: &reqwest::Client, session: &SessionMaterial, books: &mut [OwnedBook]) {
+    let mut tasks = tokio::task::JoinSet::new();
+    for (idx, book) in books.iter().enumerate() {
+        if book.asin.len() > 12 || book.percentage > 0.0 {
+            continue;
+        }
+        let client = client.clone();
+        let session = session.clone();
+        let asin = book.asin.clone();
+        tasks.spawn(async move {
+            let pos = fetch_reader_progress(&client, &session, &asin).await;
+            (idx, pos)
+        });
+    }
+    while let Some(Ok((idx, Some(pos)))) = tasks.join_next().await {
+        if let Some(book) = books.get_mut(idx) {
+            if pos.percentage > 0.0 {
+                book.percentage = pos.percentage;
+            }
+        }
+    }
+}
+
+pub async fn fetch_reader_progress(
+    client: &reqwest::Client,
+    session: &SessionMaterial,
+    asin: &str,
+) -> Option<ReadingPosition> {
+    if asin.is_empty() || asin.len() > 12 {
+        return None;
+    }
+    let url = reader_url(session.region, asin);
+    let response = client
+        .get(&url)
+        .header("User-Agent", CHROME_UA)
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+        .header("Cookie", cookie_header(&session.cookies))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let html = response.text().await.ok()?;
+    parse_reader_html_progress(&html, asin)
+}
+
+pub fn parse_reader_html_progress(html: &str, asin: &str) -> Option<ReadingPosition> {
+    let normalized = html.replace("\\x22", "\"").replace("\\\"", "\"");
+    let pos_re = regex::Regex::new(r#""mostRecentPositionRead"\s*:\s*(\d+)"#).ok()?;
+    let end_re = regex::Regex::new(r#""endReadingPosition"\s*:\s*(\d+)"#).ok()?;
+    let srl_re = regex::Regex::new(r#""srl"\s*:\s*(\d+)"#).ok()?;
+    let html = normalized.as_str();
+    let pos: i64 = pos_re.captures(html)?.get(1)?.as_str().parse().ok()?;
+    let end: i64 = end_re.captures(html)?.get(1)?.as_str().parse().ok()?;
+    let srl: i64 = srl_re
+        .captures(html)
+        .and_then(|cap| cap.get(1))
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(0);
+    let percentage = if pos > 1 && end > 0 && (srl <= 0 || pos > srl) {
+        (pos as f64 / end as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Some(ReadingPosition {
+        asin: asin.to_string(),
+        position: pos,
+        percentage,
+        sync_time: 0,
+    })
+}
+
+pub async fn fetch_pdocs(client: &reqwest::Client, session: &SessionMaterial) -> Result<Vec<OwnedBook>, CloudError> {
+    let store = session.region.store_origin();
+    let page_url = format!("{store}/hz/mycd/digital-console/contentlist/pdocs/dateDsc");
+    let ajax_url = format!("{store}/hz/mycd/digital-console/ajax");
+    let csrf_re = regex::Regex::new(r#"csrfToken\s*[:=]\s*["']([^"']+)"#)
+        .map_err(|error| CloudError::Json(error.to_string()))?;
+    let activity_input = r#"{"contentType":"KindlePDoc","contentCategoryReference":"pdocs","itemStatusList":["Active"],"isExtendedMYK":false,"fetchCriteria":{"sortOrder":"DESCENDING","sortIndex":"DATE","startIndex":0,"batchSize":50,"totalContentCount":-1},"surfaceType":"Desktop"}"#;
+
+    let mut cookies = session.cookies.clone();
+    let mut csrf = String::new();
+    for attempt in 0..4 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(350 * attempt as u64)).await;
+        }
+        let Ok(response) = client
+            .get(&page_url)
+            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3")
+            .header("Accept-Encoding", "identity")
+            .header("Cookie", cookie_header(&cookies))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        for header in response.headers().get_all(reqwest::header::SET_COOKIE) {
+            if let Ok(raw) = header.to_str() {
+                if let Some(pair) = raw.split(';').next() {
+                    if let Some((name, value)) = pair.trim().split_once('=') {
+                        let name = name.trim();
+                        let value = value.trim().trim_matches('"');
+                        if !name.is_empty() && value != "-" && !value.is_empty() {
+                            if let Some(existing) = cookies.iter_mut().find(|c| c.name.eq_ignore_ascii_case(name)) {
+                                existing.value = value.to_string();
+                            } else {
+                                cookies.push(StoredCookie {
+                                    name: name.to_string(),
+                                    value: value.to_string(),
+                                    domain: String::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(html) = response.text().await {
+            if let Some(found) = csrf_re.captures(&html).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()) {
+                csrf = found;
+                break;
+            }
+        }
+    }
+    if csrf.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let form_body = format!(
+        "activity=GetContentOwnershipData&activityInput={}&clientId=MYCD_WebService&csrfToken={}",
+        urlencoding(activity_input),
+        urlencoding(&csrf)
+    );
+    for attempt in 0..4 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(350 * attempt as u64)).await;
+        }
+        let Ok(ajax_resp) = client
+            .post(&ajax_url)
+            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+            .header("Accept", "application/json, text/javascript, */*; q=0.01")
+            .header("Accept-Language", "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3")
+            .header("Accept-Encoding", "identity")
+            .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+            .header("Origin", store)
+            .header("Referer", &page_url)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Cookie", cookie_header(&cookies))
+            .body(form_body.clone())
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !ajax_resp.status().is_success() {
+            continue;
+        }
+        if let Ok(ajax_text) = ajax_resp.text().await {
+            if let Ok(books) = parse_pdocs_document(&ajax_text, session.region) {
+                return Ok(books);
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
+pub fn parse_pdocs_document(body: &str, region: Region) -> Result<Vec<OwnedBook>, CloudError> {
+    let value: Value = serde_json::from_str(body).map_err(|error| CloudError::Json(error.to_string()))?;
+    let items = value
+        .get("GetContentOwnershipData")
+        .and_then(|node| node.get("items"))
+        .and_then(|node| node.as_array())
+        .or_else(|| items_of(&value))
+        .ok_or(CloudError::EmptyLibrary)?;
+    let mut books = Vec::new();
+    for item in items {
+        if let Some(book) = book_from_item(item, region) {
+            if !books.iter().any(|existing: &OwnedBook| existing.title.eq_ignore_ascii_case(&book.title)) {
+                books.push(book);
+            }
+        }
+    }
+    Ok(books)
 }
 
 pub async fn fetch_annotations(session: &SessionMaterial, asin: &str) -> Result<Vec<CloudAnnotation>, CloudError> {
@@ -407,7 +623,8 @@ fn book_from_item(item: &Value, region: Region) -> Option<OwnedBook> {
     if asin.len() < 6 {
         return None;
     }
-    let title = first_string(item, &["title", "productTitle"]).unwrap_or_else(|| asin.clone());
+    let raw_title = first_string(item, &["title", "productTitle"]).unwrap_or_else(|| asin.clone());
+    let title = clean_title(&raw_title);
     let author = authors_of(item);
     let cover_url = cover_of(item);
     let percentage = percentage_field(item);
@@ -425,7 +642,7 @@ fn book_from_item(item: &Value, region: Region) -> Option<OwnedBook> {
 }
 
 fn authors_of(item: &Value) -> String {
-    let names = match item.get("authors").or_else(|| item.get("author")) {
+    let names = match item.get("authors").or_else(|| item.get("author")).or_else(|| item.get("sortableAuthors")) {
         Some(Value::String(value)) => vec![clean_author(value)],
         Some(Value::Array(list)) => list
             .iter()
@@ -442,8 +659,127 @@ fn authors_of(item: &Value) -> String {
     }
 }
 
+pub fn decode_html_entities(input: &str) -> String {
+    let mut s = input
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&atilde;", "ã")
+        .replace("&Atilde;", "Ã")
+        .replace("&otilde;", "õ")
+        .replace("&Otilde;", "Õ")
+        .replace("&aacute;", "á")
+        .replace("&Aacute;", "Á")
+        .replace("&eacute;", "é")
+        .replace("&Eacute;", "É")
+        .replace("&iacute;", "í")
+        .replace("&Iacute;", "Í")
+        .replace("&oacute;", "ó")
+        .replace("&Oacute;", "Ó")
+        .replace("&uacute;", "ú")
+        .replace("&Uacute;", "Ú")
+        .replace("&acirc;", "â")
+        .replace("&Acirc;", "Â")
+        .replace("&ecirc;", "ê")
+        .replace("&Ecirc;", "Ê")
+        .replace("&ocirc;", "ô")
+        .replace("&Ocirc;", "Ô")
+        .replace("&agrave;", "à")
+        .replace("&Agrave;", "À")
+        .replace("&ccedil;", "ç")
+        .replace("&Ccedil;", "Ç")
+        .replace("&uuml;", "ü")
+        .replace("&Uuml;", "Ü")
+        .replace("&ntilde;", "ñ")
+        .replace("&Ntilde;", "Ñ")
+        .replace("&rsquo;", "’")
+        .replace("&lsquo;", "‘")
+        .replace("&ldquo;", "“")
+        .replace("&rdquo;", "”")
+        .replace("&ndash;", "–")
+        .replace("&mdash;", "—")
+        .replace("&hellip;", "…");
+    if s.contains("&#") {
+        if let Ok(dec_re) = regex::Regex::new(r"&#(\d+);") {
+            s = dec_re
+                .replace_all(&s, |caps: &regex::Captures| {
+                    caps.get(1)
+                        .and_then(|m| m.as_str().parse::<u32>().ok())
+                        .and_then(char::from_u32)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
+                })
+                .into_owned();
+        }
+        if let Ok(hex_re) = regex::Regex::new(r"(?i)&#x([0-9a-f]+);") {
+            s = hex_re
+                .replace_all(&s, |caps: &regex::Captures| {
+                    caps.get(1)
+                        .and_then(|m| u32::from_str_radix(m.as_str(), 16).ok())
+                        .and_then(char::from_u32)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
+                })
+                .into_owned();
+        }
+    }
+    s.replace("c\u{0327}", "ç")
+        .replace("C\u{0327}", "Ç")
+        .replace("a\u{0303}", "ã")
+        .replace("A\u{0303}", "Ã")
+        .replace("o\u{0303}", "õ")
+        .replace("O\u{0303}", "Õ")
+}
+
+pub fn clean_title(raw: &str) -> String {
+    let mut s = decode_html_entities(raw).trim().to_string();
+    if let Some((head, _)) = s.split_once(" -- ") {
+        if head.trim().len() >= 3 {
+            s = head.trim().to_string();
+        }
+    }
+    let suffixes = [
+        "(Portuguese Edition)",
+        "(English Edition)",
+        "(Spanish Edition)",
+        "(Edição em Português)",
+        "(Edição Portuguesa)",
+        "[Print Replica]",
+    ];
+    loop {
+        let trimmed = s.trim_end();
+        let mut changed = false;
+        for suffix in suffixes {
+            let cut = trimmed.len().saturating_sub(suffix.len());
+            if trimmed.len() > suffix.len()
+                && trimmed.is_char_boundary(cut)
+                && trimmed[cut..].eq_ignore_ascii_case(suffix)
+            {
+                s = trimmed[..trimmed.len() - suffix.len()].trim_end().to_string();
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if !s.contains(' ') && (s.contains('-') || s.contains('_')) {
+        s = s.replace(['-', '_'], " ");
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn clean_author(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches(':').trim();
+    let decoded = decode_html_entities(raw);
+    let trimmed = decoded.trim().trim_end_matches(':').trim();
+    if trimmed.eq_ignore_ascii_case("unknown") || trimmed.to_ascii_lowercase().contains("preparado para") {
+        return "Documento pessoal".into();
+    }
     let primary = if trimmed.contains(':') {
         trimmed
             .split(':')
@@ -478,7 +814,7 @@ fn cover_of(item: &Value) -> String {
             continue;
         };
         let value = value.trim();
-        if value.is_empty() {
+        if value.is_empty() || value.contains("MYX-Docs-Icons") {
             continue;
         }
         if key == "productUrl" && !looks_like_cover(value) {
