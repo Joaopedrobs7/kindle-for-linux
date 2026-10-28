@@ -139,13 +139,6 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [reading])
 
-  function closeCloudReader() {
-    setReading(null)
-    setView('shelf')
-    void cloudCloseReader()
-    void refresh()
-  }
-
   async function openCloudBook(book: Book) {
     setReading(book)
     setView('shelf')
@@ -194,32 +187,13 @@ export function App() {
   }
 
   const appearance = snap.settings.appearance === 'ink' ? 'ink' : 'paper'
+  const cloudReading = reading?.source === 'cloud'
 
   return (
     <div className="app" data-appearance={appearance} data-fullscreen={full ? 'yes' : 'no'}>
-      {!reading && <Sidebar view={view} onNavigate={(next) => { setView(next); setMessage('') }} />}
+      {(!reading || cloudReading) && <Sidebar view={view} onNavigate={(next) => { setView(next); setMessage('') }} />}
       <main>
-        {reading?.source === 'cloud' ? (
-          <div className="cloud-read" data-testid="cloud-reader">
-            <header className="reader-bar">
-              <button type="button" onClick={closeCloudReader}>← Biblioteca</button>
-              <span aria-hidden="true">·</span>
-              <strong className="reader-bar-title">{reading.title}</strong>
-              <span className="reader-bar-author">{reading.author}</span>
-              <span className="reader-bar-spacer" />
-              <button
-                type="button"
-                onClick={() => setFull((value) => {
-                  void setFullscreen(!value)
-                  return !value
-                })}
-              >
-                Tela cheia
-              </button>
-            </header>
-            <p className="cloud-read-wait">Abrindo o livro…</p>
-          </div>
-        ) : reading ? (
+        {reading && !cloudReading ? (
           <Reader
             key={reading.id}
             bookId={reading.id}

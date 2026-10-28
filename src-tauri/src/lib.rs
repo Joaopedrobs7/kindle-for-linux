@@ -11,10 +11,9 @@ use std::fs;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tauri::webview::WebviewBuilder;
 use tauri::{
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalSize, State, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder, WindowEvent,
+    webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalSize, State, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 
 use crate::db::Db;
@@ -250,6 +249,16 @@ fn cloud_load_example(state: State<AppState>) -> Result<model::Snapshot, String>
     db.snapshot()
 }
 
+fn cloud_reader_exit_url(url: &str) -> bool {
+    if url.contains("kl-close") {
+        return true;
+    }
+    // Match the library path only. A sign-in URL often echoes `/kindle-library`
+    // inside a return_to query, and that must not dismiss the reader.
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.contains("/kindle-library")
+}
+
 #[tauri::command]
 fn cloud_open_reader(app: AppHandle, asin: String, title: Option<String>) -> Result<(), String> {
     let _ = title;
@@ -259,42 +268,79 @@ fn cloud_open_reader(app: AppHandle, asin: String, title: Option<String>) -> Res
         let session = db.session()?;
         (Region::parse(&session.region), session)
     };
-    let window = app.get_window("main").ok_or_else(|| "Janela principal ausente".to_string())?;
-    if let Some(existing) = app.get_webview_window("cloud-reader") {
-        let _ = existing.close();
-    }
     if let Some(existing) = app.get_webview("cloud-reader") {
         let _ = existing.close();
     }
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let inner = window.inner_size().unwrap_or(PhysicalSize::new(1240, 820));
-    let width = (inner.width as f64 / scale).max(320.0);
-    let height = (inner.height as f64 / scale - READER_BAR_PX).max(240.0);
+    // Cookies go into the shared WebKit jar before the reader is created.
+    // Hiding "main" lets "cloud-reader" take the whole GtkBox (Linux packs every
+    // webview with expand+fill and ignores LogicalPosition).
+    if let Some(main_wv) = app.get_webview("main") {
+        push_session_cookies(&main_wv, &session);
+        let _ = main_wv.hide();
+    }
+    let window = app.get_window("main").ok_or_else(|| "Janela principal ausente".to_string())?;
+    let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
+    let physical = window.inner_size().map_err(|error| error.to_string())?;
+    let width = physical.width as f64 / scale;
+    let full_height = physical.height as f64 / scale;
     let target = reader_url(region, &asin);
-    let url = target.parse().map_err(|error: url::ParseError| error.to_string())?;
+    let reader: url::Url = target.parse().map_err(|error: url::ParseError| error.to_string())?;
+    let blank: url::Url = "about:blank".parse().map_err(|error: url::ParseError| error.to_string())?;
+    let navigate_app = app.clone();
+    let builder = WebviewBuilder::new("cloud-reader", WebviewUrl::External(blank))
+        .user_agent(kindle_cloud::CHROME_UA)
+        .initialization_script(reader_init_script())
+        .on_navigation(move |url| {
+            if cloud_reader_exit_url(url.as_str()) {
+                let app = navigate_app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    close_cloud_reader_internal(&app);
+                });
+                return false;
+            }
+            true
+        });
     let webview = window
-        .add_child(
-            WebviewBuilder::new("cloud-reader", WebviewUrl::External(url))
-                .user_agent(kindle_cloud::CHROME_UA)
-                .initialization_script("if (!window.chrome) { window.chrome = { runtime: {} }; }")
-                .initialization_script(reader_init_script()),
-            LogicalPosition::new(0.0, READER_BAR_PX),
-            LogicalSize::new(width, height),
-        )
+        .add_child(builder, LogicalPosition::new(0.0, 0.0), LogicalSize::new(width, full_height))
         .map_err(|error| error.to_string())?;
     push_session_cookies(&webview, &session);
+    let _ = webview.navigate(reader);
+    let _ = webview.set_focus();
+    spawn_reader_close_watcher(app);
     Ok(())
+}
+
+fn close_cloud_reader_internal(app: &AppHandle) {
+    if let Some(main_wv) = app.get_webview("main") {
+        let _ = main_wv.show();
+        let _ = main_wv.set_focus();
+    }
+    if let Some(webview) = app.get_webview("cloud-reader") {
+        let _ = webview.close();
+    }
+    let _ = app.emit("cloud-reader-closed", ());
+}
+
+fn spawn_reader_close_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let Some(webview) = app.get_webview("cloud-reader") else {
+                break;
+            };
+            let page = webview.url().map(|url| url.to_string()).unwrap_or_default();
+            if cloud_reader_exit_url(&page) {
+                close_cloud_reader_internal(&app);
+                break;
+            }
+        }
+    });
 }
 
 #[tauri::command]
 fn cloud_close_reader(app: AppHandle) -> Result<(), String> {
-    if let Some(webview) = app.get_webview("cloud-reader") {
-        let _ = webview.close();
-    }
-    if let Some(window) = app.get_webview_window("cloud-reader") {
-        let _ = window.close();
-    }
-    let _ = app.emit("cloud-reader-closed", ());
+    close_cloud_reader_internal(&app);
     Ok(())
 }
 
@@ -305,8 +351,6 @@ fn set_fullscreen(app: AppHandle, enabled: bool) -> Result<(), String> {
     }
     Ok(())
 }
-
-const READER_BAR_PX: f64 = 48.0;
 
 fn spawn_login_watcher(app: AppHandle, region: Region) {
     tauri::async_runtime::spawn(async move {
@@ -424,34 +468,94 @@ fn login_is_ready(cookies: &[StoredCookie], page: &str) -> bool {
 }
 
 fn push_session_cookies(webview: &tauri::Webview, session: &StoredSession) {
-    let fallback = if Region::parse(&session.region) == Region::Br {
-        ".amazon.com.br"
-    } else {
-        ".amazon.com"
+    let domains: &[&str] = match Region::parse(&session.region) {
+        Region::Br => &[".amazon.com.br", "amazon.com.br", "ler.amazon.com.br", "www.amazon.com.br"],
+        Region::Us => &[".amazon.com", "amazon.com", "read.amazon.com", "www.amazon.com"],
     };
     for stored in &session.cookies {
         if stored.name.is_empty() || stored.value.is_empty() {
             continue;
         }
-        let domain = if stored.domain.is_empty() { fallback } else { stored.domain.as_str() };
-        let cookie = tauri::webview::cookie::Cookie::build((stored.name.clone(), stored.value.clone()))
-            .domain(domain.to_string())
-            .path("/")
-            .secure(true)
-            .http_only(true)
-            .build();
-        let _ = webview.set_cookie(cookie);
+        for domain in domains {
+            let cookie = tauri::webview::cookie::Cookie::build((stored.name.as_str(), stored.value.as_str()))
+                .domain(*domain)
+                .path("/")
+                .secure(true)
+                .build();
+            let _ = webview.set_cookie(cookie);
+        }
     }
 }
 
 fn reader_init_script() -> String {
     let css = format!(
-        "{READER_QUIET_CSS}\n#kl-back{{position:fixed;top:10px;left:12px;z-index:2147483646;background:#F6F3EC;color:#141413;border:1px solid #d8d2c6;border-radius:999px;padding:8px 14px;font:600 13px/1 sans-serif;cursor:pointer;}}"
+        "{READER_QUIET_CSS}\n#kl-back{{position:fixed;top:12px;left:16px;z-index:2147483647;background:#F6F3EC;color:#141413;border:1px solid #d8d2c6;border-radius:6px;padding:9px 16px;font:600 13px/1 system-ui,sans-serif;cursor:pointer;}}"
     );
     let css = serde_json::to_string(&css).unwrap_or_else(|_| "\"\"".into());
-    format!(
-        r#"(function(){{const css={css};const mount=()=>{{const root=document.documentElement;if(!root)return;let s=document.getElementById('kl-quiet');if(!s){{s=document.createElement('style');s.id='kl-quiet';root.appendChild(s);}}s.textContent=css;if(!document.getElementById('kl-back')){{const b=document.createElement('button');b.id='kl-back';b.type='button';b.textContent='← Voltar para a Biblioteca';b.addEventListener('click',()=>{{const invoke=window.__TAURI_INTERNALS__&&window.__TAURI_INTERNALS__.invoke;if(invoke)invoke('cloud_close_reader');}});(document.body||root).appendChild(b);}}}};const boot=()=>{{mount();if(document.documentElement)new MutationObserver(mount).observe(document.documentElement,{{childList:true,subtree:true}});}};if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);else boot();}})();"#
-    )
+    r#"(function(){
+if (window.__klBound) return;
+window.__klBound = true;
+const css = CSS_PLACEHOLDER;
+let leaving = false;
+const goHome = () => {
+  if (leaving) return;
+  leaving = true;
+  try {
+    const invoke = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke;
+    if (invoke) invoke('cloud_close_reader');
+  } catch (e) {}
+  window.location.replace('/kindle-library#kl-close');
+};
+const mount = () => {
+  const root = document.documentElement;
+  if (!root) return;
+  let s = document.getElementById('kl-quiet');
+  if (!s) {
+    s = document.createElement('style');
+    s.id = 'kl-quiet';
+    root.appendChild(s);
+  }
+  if (s.textContent !== css) s.textContent = css;
+  if (!document.getElementById('kl-back')) {
+    const b = document.createElement('button');
+    b.id = 'kl-back';
+    b.type = 'button';
+    b.textContent = '← Biblioteca';
+    b.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      goHome();
+    });
+    root.appendChild(b);
+  }
+};
+const onKey = (event) => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    goHome();
+  }
+};
+window.addEventListener('click', (event) => {
+  const button = document.getElementById('kl-back');
+  if (!button) return;
+  const rect = button.getBoundingClientRect();
+  const inside = event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+  if (event.target === button || button.contains(event.target) || inside) {
+    event.preventDefault();
+    event.stopPropagation();
+    goHome();
+  }
+}, true);
+window.addEventListener('keydown', onKey, true);
+document.addEventListener('keydown', onKey, true);
+const boot = () => {
+  mount();
+  if (document.documentElement) new MutationObserver(mount).observe(document.documentElement, {childList:true});
+};
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+else boot();
+})();"#
+        .replace("CSS_PLACEHOLDER", &css)
 }
 
 fn resize_cloud_reader(app: &AppHandle, size: PhysicalSize<u32>) {
@@ -463,8 +567,8 @@ fn resize_cloud_reader(app: &AppHandle, size: PhysicalSize<u32>) {
     };
     let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
     let width = (size.width as f64 / scale).max(320.0);
-    let height = (size.height as f64 / scale - READER_BAR_PX).max(1.0);
-    let _ = webview.set_position(LogicalPosition::new(0.0, READER_BAR_PX));
+    let height = (size.height as f64 / scale).max(240.0);
+    let _ = webview.set_position(LogicalPosition::new(0.0, 0.0));
     let _ = webview.set_size(LogicalSize::new(width, height));
 }
 
@@ -499,14 +603,29 @@ fn open_amazon_window(app: &AppHandle, label: &str, title: &str, target: &str, s
 
 #[cfg(test)]
 mod tests {
-    use super::reader_init_script;
+    use super::{cloud_reader_exit_url, reader_init_script};
+
+    #[test]
+    fn reader_exit_url_ignores_signin_query() {
+        assert!(cloud_reader_exit_url("https://ler.amazon.com.br/kindle-library#kl-close"));
+        assert!(cloud_reader_exit_url("https://ler.amazon.com.br/kindle-library"));
+        assert!(cloud_reader_exit_url("/kindle-library#kl-close"));
+        assert!(!cloud_reader_exit_url("https://ler.amazon.com.br/?asin=B084RMWS4D"));
+        assert!(!cloud_reader_exit_url(
+            "https://www.amazon.com.br/ap/signin?openid.return_to=https://ler.amazon.com.br/kindle-library"
+        ));
+    }
 
     #[test]
     fn reader_script_returns_home_and_balances_braces() {
         let script = reader_init_script();
         assert!(script.contains("cloud_close_reader"));
-        assert!(script.contains("Voltar para a Biblioteca"));
+        assert!(script.contains("← Biblioteca"));
+        assert!(script.contains("/kindle-library#kl-close"));
+        assert!(script.contains("Escape"));
+        assert!(script.contains(".top-chrome__back-button"));
         assert!(script.contains("#kindleReaderHeader"));
+        assert!(!script.contains("#reader-header"));
         let mut depth = 0i32;
         for ch in script.chars() {
             if ch == '{' {
