@@ -78,19 +78,7 @@ impl Db {
                 .collect::<Vec<_>>();
             db.save_folders(&folders)?;
         }
-        if let Ok(mut existing) = db.folders() {
-            let mut changed = false;
-            for def in default_folders() {
-                let s = def.display().to_string();
-                if !existing.contains(&s) {
-                    existing.push(s);
-                    changed = true;
-                }
-            }
-            if changed {
-                let _ = db.save_folders(&existing);
-            }
-        }
+        let _ = db.ensure_default_folders();
         let _ = db.clean_existing_titles();
         Ok(db)
     }
@@ -139,10 +127,43 @@ impl Db {
             settings: self.settings()?,
             session: self.session_status()?,
             folders: self.folders()?,
+            sync_notice: self.sync_notice(),
         })
     }
 
+    pub fn sync_notice(&self) -> String {
+        self.kv("sync_notice").ok().flatten().unwrap_or_default()
+    }
+
+    pub fn set_sync_notice(&self, notice: &str) -> Result<(), String> {
+        if notice.is_empty() {
+            self.conn
+                .execute("DELETE FROM kv WHERE key = 'sync_notice'", [])
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        self.put_kv("sync_notice", notice)
+    }
+
+    pub fn ensure_default_folders(&self) -> Result<(), String> {
+        let mut existing = self.folders().unwrap_or_default();
+        let mut changed = false;
+        for def in default_folders() {
+            let path = def.display().to_string();
+            if path.is_empty() || existing.iter().any(|item| item == &path) {
+                continue;
+            }
+            existing.push(path);
+            changed = true;
+        }
+        if changed {
+            self.save_folders(&existing)?;
+        }
+        Ok(())
+    }
+
     pub fn scan(&self) -> Result<bool, String> {
+        let _ = self.ensure_default_folders();
         let folders = self.folders()?;
         let mut found = Vec::new();
         for folder in &folders {
@@ -553,15 +574,56 @@ impl Db {
 
 pub fn default_folders() -> Vec<PathBuf> {
     let mut folders = Vec::new();
+    let mut push = |path: PathBuf| {
+        if path.as_os_str().is_empty() || folders.iter().any(|item| item == &path) {
+            return;
+        }
+        folders.push(path);
+    };
     if let Ok(home) = std::env::var("HOME") {
-        let base = PathBuf::from(home);
-        folders.push(base.join("Documents/Kindle"));
-        folders.push(base.join("Downloads"));
-        folders.push(base.join("Documents"));
-        folders.push(base.join("Documentos"));
+        let base = PathBuf::from(&home);
+        let documents = user_dir("XDG_DOCUMENTS_DIR", &home).unwrap_or_else(|| base.join("Documents"));
+        let downloads = user_dir("XDG_DOWNLOAD_DIR", &home).unwrap_or_else(|| base.join("Downloads"));
+        push(documents.join("Kindle"));
+        push(downloads);
+        push(documents.clone());
+        push(base.join("Documents/Kindle"));
+        push(base.join("Downloads"));
+        push(base.join("Documents"));
+        push(base.join("Documentos"));
     }
-    folders.push(PathBuf::from("/workspace/kindle"));
+    let workspace = PathBuf::from("/workspace/kindle");
+    if workspace.is_dir() {
+        push(workspace);
+    }
     folders
+}
+
+fn user_dir(key: &str, home: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(home).join(".config/user-dirs.dirs");
+    let text = fs::read_to_string(path).ok()?;
+    parse_user_dir(&text, key, home).filter(|dir| dir.is_dir())
+}
+
+fn parse_user_dir(text: &str, key: &str, home: &str) -> Option<PathBuf> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(key) else {
+            continue;
+        };
+        let Some(value) = rest.trim().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        let expanded = value.replace("$HOME", home).replace("${HOME}", home);
+        if !expanded.is_empty() {
+            return Some(PathBuf::from(expanded));
+        }
+    }
+    None
 }
 
 fn collect_epubs(dir: &Path, found: &mut Vec<PathBuf>, depth: u8) {
@@ -654,5 +716,18 @@ mod tests {
         assert!(markdown.contains("Maré de Pedra"));
         assert!(clippings.contains("=========="));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_dirs_expand_home() {
+        let text = "XDG_DOCUMENTS_DIR=\"$HOME/Documentos\"\nXDG_DOWNLOAD_DIR=\"${HOME}/Downloads\"\n";
+        assert_eq!(
+            parse_user_dir(text, "XDG_DOCUMENTS_DIR", "/home/joao").unwrap(),
+            PathBuf::from("/home/joao/Documentos")
+        );
+        assert_eq!(
+            parse_user_dir(text, "XDG_DOWNLOAD_DIR", "/home/joao").unwrap(),
+            PathBuf::from("/home/joao/Downloads")
+        );
     }
 }

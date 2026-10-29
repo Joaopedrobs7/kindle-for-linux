@@ -11,6 +11,8 @@ export function Shelf({
   signedIn = true,
   onLogin,
   onImport,
+  notice = '',
+  onRetry,
 }: {
   books: Book[]
   query: string
@@ -20,6 +22,8 @@ export function Shelf({
   signedIn?: boolean
   onLogin?: () => void
   onImport?: () => void
+  notice?: string
+  onRetry?: () => void
 }) {
   const [layout, setLayout] = useState<'grid' | 'list'>('grid')
   const visible = useMemo(() => {
@@ -47,6 +51,12 @@ export function Shelf({
           </div>
         </div>
       </header>
+      {notice ? (
+        <p className="sync-notice" role="status">
+          <span>Não consegui buscar seus documentos pessoais: {notice}</span>
+          <button type="button" className="line" onClick={onRetry}>Tentar de novo</button>
+        </p>
+      ) : null}
       {visible.length === 0 ? (
         books.length === 0 && !signedIn ? (
           <div className="welcome">

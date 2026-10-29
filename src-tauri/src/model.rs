@@ -132,6 +132,7 @@ pub struct Snapshot {
     pub settings: Settings,
     pub session: SessionStatus,
     pub folders: Vec<String>,
+    pub sync_notice: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

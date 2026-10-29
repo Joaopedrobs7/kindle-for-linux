@@ -7,9 +7,11 @@ mod model;
 mod overview;
 
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{
     webview::WebviewBuilder, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalSize, State, WebviewUrl,
@@ -212,12 +214,42 @@ async fn cloud_sync(app: AppHandle, region: Option<String>) -> Result<model::Sna
             session.region = Region::parse(&region).as_str().into();
             db.save_session(&session)?;
         }
+        if let Some(window) = app.get_webview_window("main") {
+            let fresh = collect_login_cookies(&window, Region::parse(&session.region));
+            if !fresh.is_empty() {
+                session.cookies = merge_cookies(session.cookies, fresh);
+                db.save_session(&session)?;
+            }
+        }
+        let _ = db.ensure_default_folders();
+        let _ = db.scan();
+        let folders = db.folders().unwrap_or_default();
+        let present: Vec<_> = folders.iter().filter(|folder| PathBuf::from(folder).is_dir()).cloned().collect();
+        let absent: Vec<_> = folders.iter().filter(|folder| !PathBuf::from(folder).is_dir()).cloned().collect();
+        let local = db
+            .snapshot()
+            .map(|snap| snap.books.iter().filter(|book| book.source == "local" && !book.missing).count())
+            .unwrap_or(0);
+        log_sync(&app, &format!("epubs no disco: {local}; pastas: {}; ausentes: {}", present.join(", "), absent.join(", ")));
         material_from(&session)?
     };
-    let books = fetch_library(&material).await.map_err(|error| error.to_string())?;
+    let loaded = match fetch_library(&material).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            log_sync(&app, &format!("biblioteca: {error}"));
+            return Err(error.to_string());
+        }
+    };
+    if let Some(reason) = &loaded.personal_docs_error {
+        log_sync(&app, &format!("documentos pessoais: {reason}"));
+    } else {
+        let docs = loaded.books.iter().filter(|book| book.asin.len() > 12).count();
+        log_sync(&app, &format!("documentos pessoais: {docs}"));
+    }
     let state = app.state::<AppState>();
     let db = state.db.lock().map_err(|error| error.to_string())?;
-    db.upsert_cloud(&books)?;
+    db.upsert_cloud(&loaded.books)?;
+    db.set_sync_notice(loaded.personal_docs_error.as_deref().unwrap_or(""))?;
     db.snapshot()
 }
 
@@ -411,8 +443,16 @@ fn spawn_login_watcher(app: AppHandle, region: Region) {
                 device_session_token: device,
             };
             match fetch_library(&material).await {
-                Ok(books) => {
-                    if finish_login(&app, &material, Some(&books)).is_ok() {
+                Ok(loaded) => {
+                    if finish_login(&app, &material, Some(&loaded.books)).is_ok() {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            if let Ok(db) = state.db.lock() {
+                                let _ = db.set_sync_notice(loaded.personal_docs_error.as_deref().unwrap_or(""));
+                            }
+                        }
+                        if let Some(reason) = &loaded.personal_docs_error {
+                            log_sync(&app, &format!("documentos pessoais: {reason}"));
+                        }
                         let _ = window.close();
                         let _ = app.emit("library-changed", ());
                     }
@@ -449,13 +489,14 @@ fn finish_login(app: &AppHandle, material: &SessionMaterial, books: Option<&[kin
 
 fn collect_login_cookies(window: &WebviewWindow, region: Region) -> Vec<StoredCookie> {
     let mut urls = vec![
-        region.origin().to_string(),
+        region.store_origin().to_string(),
         "https://www.amazon.com.br".into(),
-        "https://ler.amazon.com.br".into(),
-        "https://www.amazon.com".into(),
-        "https://read.amazon.com".into(),
         "https://amazon.com.br".into(),
+        "https://www.amazon.com".into(),
         "https://amazon.com".into(),
+        region.origin().to_string(),
+        "https://ler.amazon.com.br".into(),
+        "https://read.amazon.com".into(),
     ];
     if let Ok(current) = window.url() {
         urls.push(origin_of(&current));
@@ -473,17 +514,42 @@ fn collect_login_cookies(window: &WebviewWindow, region: Region) -> Vec<StoredCo
         for cookie in found {
             let name = cookie.name().to_string();
             let value = cookie.value().to_string();
-            if value.is_empty() || !seen.insert(name.to_ascii_lowercase()) {
+            let domain = cookie.domain().unwrap_or("").to_string();
+            let key = format!("{}|{}", name.to_ascii_lowercase(), domain.to_ascii_lowercase());
+            if value.is_empty() || !seen.insert(key) {
                 continue;
             }
-            cookies.push(StoredCookie {
-                name,
-                value,
-                domain: cookie.domain().unwrap_or("").to_string(),
-            });
+            cookies.push(StoredCookie { name, value, domain });
         }
     }
     cookies
+}
+
+fn merge_cookies(mut saved: Vec<StoredCookie>, fresh: Vec<StoredCookie>) -> Vec<StoredCookie> {
+    for cookie in fresh {
+        if cookie.name.is_empty() || cookie.value.is_empty() {
+            continue;
+        }
+        if let Some(existing) = saved.iter_mut().find(|item| item.name.eq_ignore_ascii_case(&cookie.name) && item.domain.eq_ignore_ascii_case(&cookie.domain)) {
+            existing.value = cookie.value;
+        } else {
+            saved.push(cookie);
+        }
+    }
+    saved
+}
+
+fn log_sync(app: &AppHandle, message: &str) {
+    let dir = app.path().app_data_dir().unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home).join(".local/share/com.kindlelinux.desktop")
+    });
+    let _ = fs::create_dir_all(&dir);
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(dir.join("sync.log")) else {
+        return;
+    };
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis()).unwrap_or(0);
+    let _ = writeln!(file, "{millis} {message}");
 }
 
 fn origin_of(url: &url::Url) -> String {

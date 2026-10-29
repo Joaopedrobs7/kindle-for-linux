@@ -51,6 +51,7 @@ function snapshot(): Snapshot {
     settings: { ...current, reader: { ...current.reader } },
     session: { ...session, cookieNames: [...session.cookieNames] },
     folders: ['/home/ubuntu/Documents/Kindle', '/workspace/kindle'],
+    syncNotice: '',
   }
 }
 

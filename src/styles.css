@@ -58,6 +58,7 @@ main { flex: 1; min-width: 0; overflow: auto; }
 }
 .page-head h1 { font-size: 42px; margin: 0; line-height: 1; }
 .page-head p, .by, .empty, .notice, .session-line { color: var(--muted); margin: 8px 0 0; }
+.sync-notice { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin: 0 0 22px; padding: 10px 12px; background: #fbf6e8; border: 1px solid #e4d7a8; border-radius: 8px; }
 .head-tools, .button-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .head-tools input, .search-line input, .cookie-field textarea, .clip-group textarea {
   background: transparent;

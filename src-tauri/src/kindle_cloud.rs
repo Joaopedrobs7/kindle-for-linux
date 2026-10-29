@@ -29,6 +29,16 @@ pub enum CloudError {
     MissingPosition,
     #[error("rede: {0}")]
     Network(String),
+    #[error("a Amazon pediu para entrar de novo na loja para ver os documentos pessoais")]
+    NeedsReauth,
+    #[error("{0}")]
+    PersonalDocs(String),
+}
+
+#[derive(Debug)]
+pub struct LibraryLoad {
+    pub books: Vec<OwnedBook>,
+    pub personal_docs_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,12 +176,69 @@ pub fn request_headers(session: &SessionMaterial) -> Vec<(String, String)> {
 }
 
 pub fn cookie_header(cookies: &[StoredCookie]) -> String {
-    cookies
+    cookie_header_for(cookies, false)
+}
+
+/// `prefer_store` picks www.amazon cookies over host-only ler.amazon / read.amazon cookies.
+pub fn cookie_header_for(cookies: &[StoredCookie], prefer_store: bool) -> String {
+    let mut chosen: Vec<&StoredCookie> = Vec::new();
+    for cookie in cookies {
+        if cookie.name.is_empty() || cookie.value.is_empty() {
+            continue;
+        }
+        if let Some(slot) = chosen.iter_mut().find(|item| item.name.eq_ignore_ascii_case(&cookie.name)) {
+            if domain_rank(&cookie.domain, prefer_store) > domain_rank(&slot.domain, prefer_store) {
+                *slot = cookie;
+            }
+        } else {
+            chosen.push(cookie);
+        }
+    }
+    chosen
         .iter()
-        .filter(|cookie| !cookie.name.is_empty())
         .map(|cookie| format!("{}={}", cookie.name, cookie.value))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn domain_rank(domain: &str, prefer_store: bool) -> u8 {
+    let reader = is_reader_host(domain);
+    let store = is_store_host(domain);
+    if prefer_store {
+        if store && !reader {
+            3
+        } else if !reader {
+            2
+        } else if store {
+            1
+        } else {
+            0
+        }
+    } else if reader {
+        3
+    } else if store {
+        2
+    } else {
+        1
+    }
+}
+
+fn is_reader_host(domain: &str) -> bool {
+    let host = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+    host.starts_with("ler.") || host.starts_with("read.")
+}
+
+fn is_store_host(domain: &str) -> bool {
+    let host = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+    if host.is_empty() || is_reader_host(domain) {
+        return false;
+    }
+    host == "amazon.com.br"
+        || host == "www.amazon.com.br"
+        || host == "amazon.com"
+        || host == "www.amazon.com"
+        || host.ends_with(".amazon.com.br")
+        || host.ends_with(".amazon.com")
 }
 
 pub fn parse_cookie_header(header: &str, domain: &str) -> Vec<StoredCookie> {
@@ -329,7 +396,7 @@ pub fn parse_annotations(body: &str) -> Result<Vec<CloudAnnotation>, CloudError>
     Ok(notes)
 }
 
-pub async fn fetch_library(session: &SessionMaterial) -> Result<Vec<OwnedBook>, CloudError> {
+pub async fn fetch_library(session: &SessionMaterial) -> Result<LibraryLoad, CloudError> {
     let client = http_client()?;
     let mut token: Option<String> = None;
     let mut pages = Vec::new();
@@ -351,14 +418,21 @@ pub async fn fetch_library(session: &SessionMaterial) -> Result<Vec<OwnedBook>, 
             }
         }
     }
-    if let Ok(pdocs) = fetch_pdocs(&client, session).await {
-        if !pdocs.is_empty() {
-            pages.push(pdocs);
+    let personal_docs_error = match fetch_pdocs(&client, session).await {
+        Ok(pdocs) => {
+            if !pdocs.is_empty() {
+                pages.push(pdocs);
+            }
+            None
         }
-    }
+        Err(error) => Some(error.to_string()),
+    };
     let mut merged = merge_pages(&pages);
     hydrate_library_progress(&client, session, &mut merged).await;
-    Ok(merged)
+    Ok(LibraryLoad {
+        books: merged,
+        personal_docs_error,
+    })
 }
 
 pub async fn fetch_position(session: &SessionMaterial, asin: &str) -> Result<ReadingPosition, CloudError> {
@@ -451,98 +525,256 @@ pub fn parse_reader_html_progress(html: &str, asin: &str) -> Option<ReadingPosit
 
 pub async fn fetch_pdocs(client: &reqwest::Client, session: &SessionMaterial) -> Result<Vec<OwnedBook>, CloudError> {
     let store = session.region.store_origin();
-    let page_url = format!("{store}/hz/mycd/digital-console/contentlist/pdocs/dateDsc");
-    let ajax_url = format!("{store}/hz/mycd/digital-console/ajax");
-    let csrf_re = regex::Regex::new(r#"csrfToken\s*[:=]\s*["']([^"']+)"#)
-        .map_err(|error| CloudError::Json(error.to_string()))?;
-    let activity_input = r#"{"contentType":"KindlePDoc","contentCategoryReference":"pdocs","itemStatusList":["Active"],"isExtendedMYK":false,"fetchCriteria":{"sortOrder":"DESCENDING","sortIndex":"DATE","startIndex":0,"batchSize":50,"totalContentCount":-1},"surfaceType":"Desktop"}"#;
-
+    let pages = [
+        "/hz/mycd/digital-console/contentlist/pdocs/dateDsc",
+        "/hz/mycd/digital-console/contentlist/pdocs",
+        "/hz/mycd/digital-console/contentlist/pdocs/titleAsc",
+    ];
+    let batches = [
+        r#"{"contentType":"KindlePDoc","contentCategoryReference":"pdocs","itemStatusList":["Active"],"isExtendedMYK":false,"fetchCriteria":{"sortOrder":"DESCENDING","sortIndex":"DATE","startIndex":0,"batchSize":50,"totalContentCount":-1},"surfaceType":"Desktop"}"#,
+        r#"{"contentType":"KindlePDoc","contentCategoryReference":"pdocs","itemStatusList":["Active"],"isExtendedMYK":true,"fetchCriteria":{"sortOrder":"DESCENDING","sortIndex":"DATE","startIndex":0,"batchSize":100,"totalContentCount":-1},"surfaceType":"Desktop"}"#,
+        r#"{"contentType":"KindlePDoc","contentCategoryReference":"pdocs","itemStatusList":["Active"],"isExtendedMYK":false,"fetchCriteria":{"sortOrder":"ASCENDING","sortIndex":"TITLE","startIndex":0,"batchSize":50,"totalContentCount":-1},"surfaceType":"Desktop"}"#,
+    ];
     let mut cookies = session.cookies.clone();
-    let mut csrf = String::new();
-    for attempt in 0..4 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(350 * attempt as u64)).await;
-        }
-        let Ok(response) = client
-            .get(&page_url)
-            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .header("Accept-Language", "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3")
-            .header("Accept-Encoding", "identity")
-            .header("Cookie", cookie_header(&cookies))
-            .send()
-            .await
-        else {
-            continue;
-        };
-        for header in response.headers().get_all(reqwest::header::SET_COOKIE) {
-            if let Ok(raw) = header.to_str() {
-                if let Some(pair) = raw.split(';').next() {
-                    if let Some((name, value)) = pair.trim().split_once('=') {
-                        let name = name.trim();
-                        let value = value.trim().trim_matches('"');
-                        if !name.is_empty() && value != "-" && !value.is_empty() {
-                            if let Some(existing) = cookies.iter_mut().find(|c| c.name.eq_ignore_ascii_case(name)) {
-                                existing.value = value.to_string();
-                            } else {
-                                cookies.push(StoredCookie {
-                                    name: name.to_string(),
-                                    value: value.to_string(),
-                                    domain: String::new(),
-                                });
-                            }
-                        }
-                    }
-                }
+    let mut last_error = CloudError::PersonalDocs("não achei o token da loja Amazon".into());
+    for (index, page) in pages.iter().enumerate() {
+        let page_url = format!("{store}{page}");
+        let attempts = if index == 0 { 2 } else { 1 };
+        let batch = batches[index.min(batches.len() - 1)];
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             }
-        }
-        if let Ok(html) = response.text().await {
-            if let Some(found) = csrf_re.captures(&html).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()) {
-                csrf = found;
-                break;
+            match fetch_pdocs_once(client, session.region, store, &page_url, batch, &mut cookies).await {
+                Ok(books) => return Ok(books),
+                Err(CloudError::NeedsReauth) => return Err(CloudError::NeedsReauth),
+                Err(error) => last_error = error,
             }
         }
     }
-    if csrf.is_empty() {
-        return Ok(Vec::new());
-    }
+    Err(last_error)
+}
 
+async fn fetch_pdocs_once(
+    client: &reqwest::Client,
+    region: Region,
+    store: &str,
+    page_url: &str,
+    activity_input: &str,
+    cookies: &mut Vec<StoredCookie>,
+) -> Result<Vec<OwnedBook>, CloudError> {
+    let response = client
+        .get(page_url)
+        .header("User-Agent", CHROME_UA)
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+        .header("Upgrade-Insecure-Requests", "1")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Cookie", cookie_header_for(cookies, true))
+        .send()
+        .await
+        .map_err(|error| CloudError::PersonalDocs(format!("não abri a lista de documentos ({})", error_without_secrets(&error.to_string()))))?;
+    let final_url = response.url().to_string();
+    let status = response.status();
+    absorb_set_cookie(cookies, response.headers());
+    let html = response
+        .text()
+        .await
+        .map_err(|error| CloudError::PersonalDocs(format!("resposta vazia da loja ({})", error_without_secrets(&error.to_string()))))?;
+    if looks_like_signin(&final_url, &html) {
+        return Err(CloudError::NeedsReauth);
+    }
+    if !status.is_success() {
+        return Err(CloudError::PersonalDocs(format!(
+            "a loja respondeu {} em {}",
+            status.as_u16(),
+            url_path_only(&final_url)
+        )));
+    }
+    if let Some(books) = embedded_pdocs(&html, region) {
+        return Ok(books);
+    }
+    let Some(csrf) = extract_csrf(&html) else {
+        return Err(CloudError::PersonalDocs(format!(
+            "não achei o token da loja em {}",
+            url_path_only(&final_url)
+        )));
+    };
+    let ajax_url = format!("{store}/hz/mycd/digital-console/ajax");
     let form_body = format!(
         "activity=GetContentOwnershipData&activityInput={}&clientId=MYCD_WebService&csrfToken={}",
         urlencoding(activity_input),
         urlencoding(&csrf)
     );
-    for attempt in 0..4 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(350 * attempt as u64)).await;
-        }
-        let Ok(ajax_resp) = client
-            .post(&ajax_url)
-            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
-            .header("Accept", "application/json, text/javascript, */*; q=0.01")
-            .header("Accept-Language", "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3")
-            .header("Accept-Encoding", "identity")
-            .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-            .header("Origin", store)
-            .header("Referer", &page_url)
-            .header("X-Requested-With", "XMLHttpRequest")
-            .header("Cookie", cookie_header(&cookies))
-            .body(form_body.clone())
-            .send()
-            .await
-        else {
+    let ajax = client
+        .post(&ajax_url)
+        .header("User-Agent", CHROME_UA)
+        .header("Accept", "application/json, text/javascript, */*; q=0.01")
+        .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+        .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+        .header("Origin", store)
+        .header("Referer", page_url)
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Cookie", cookie_header_for(cookies, true))
+        .body(form_body)
+        .send()
+        .await
+        .map_err(|error| CloudError::PersonalDocs(format!("a consulta dos documentos falhou ({})", error_without_secrets(&error.to_string()))))?;
+    let ajax_url_final = ajax.url().to_string();
+    let ajax_status = ajax.status();
+    absorb_set_cookie(cookies, ajax.headers());
+    let ajax_text = ajax
+        .text()
+        .await
+        .map_err(|error| CloudError::PersonalDocs(format!("resposta vazia dos documentos ({})", error_without_secrets(&error.to_string()))))?;
+    if looks_like_signin(&ajax_url_final, &ajax_text) {
+        return Err(CloudError::NeedsReauth);
+    }
+    if !ajax_status.is_success() {
+        return Err(CloudError::PersonalDocs(format!(
+            "a consulta dos documentos respondeu {}",
+            ajax_status.as_u16()
+        )));
+    }
+    parse_pdocs_document(&ajax_text, region).map_err(|_| {
+        CloudError::PersonalDocs("a loja não devolveu a lista de documentos".into())
+    })
+}
+
+pub fn extract_csrf(html: &str) -> Option<String> {
+    let normalized = html.replace("\\u0022", "\"").replace("\\\"", "\"").replace("\\x22", "\"");
+    let patterns = [
+        r#"csrfToken"\s*:\s*"([^"]+)""#,
+        r#"csrfToken'\s*:\s*'([^']+)'"#,
+        r#"csrfToken\s*[:=]\s*["']([^"']+)""#,
+        r#"name=["']csrfToken["'][^>]*value=["']([^"']+)""#,
+        r#"value=["']([^"']+)["'][^>]*name=["']csrfToken["']"#,
+        r#"anti-csrftoken-a2z["']?\s*[:=]\s*["']([^"']+)""#,
+        r#"data-csrf-token=["']([^"']+)""#,
+        r#"<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)""#,
+        r#"<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']"#,
+    ];
+    for pattern in patterns {
+        let Ok(regex) = regex::Regex::new(pattern) else {
             continue;
         };
-        if !ajax_resp.status().is_success() {
-            continue;
-        }
-        if let Ok(ajax_text) = ajax_resp.text().await {
-            if let Ok(books) = parse_pdocs_document(&ajax_text, session.region) {
-                return Ok(books);
+        if let Some(token) = regex.captures(&normalized).and_then(|cap| cap.get(1)).map(|item| item.as_str().trim().to_string()) {
+            if csrf_token_ok(&token) {
+                return Some(token);
             }
         }
     }
-    Ok(Vec::new())
+    None
+}
+
+fn csrf_token_ok(token: &str) -> bool {
+    token.len() >= 8 && token.chars().all(|char| char.is_ascii_alphanumeric() || char == '-' || char == '_' || char == '/' || char == '+' || char == '=')
+}
+
+pub fn looks_like_signin(url: &str, body: &str) -> bool {
+    let url = url.to_ascii_lowercase();
+    if url.contains("/ap/signin") || url.contains("/ap/mfa") || url.contains("openid.pape") {
+        return true;
+    }
+    let head: String = body.chars().take(20_000).collect::<String>().to_ascii_lowercase();
+    head.contains("ap_signin_form") || head.contains("auth-signin-button") || head.contains("id=\"ap_email\"")
+}
+
+fn embedded_pdocs(html: &str, region: Region) -> Option<Vec<OwnedBook>> {
+    let marker = "GetContentOwnershipData";
+    let idx = html.find(marker)?;
+    let start = html[..idx].rfind('{')?;
+    let slice = json_object_at(html, start)?;
+    parse_pdocs_document(slice, region).ok().filter(|books| !books.is_empty())
+}
+
+fn json_object_at(text: &str, start: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (offset, byte) in bytes[start..].iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if *byte == b'\\' {
+                escape = true;
+                continue;
+            }
+            if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(start..start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn absorb_set_cookie(cookies: &mut Vec<StoredCookie>, headers: &reqwest::header::HeaderMap) {
+    for header in headers.get_all(reqwest::header::SET_COOKIE) {
+        let Ok(raw) = header.to_str() else {
+            continue;
+        };
+        let Some(pair) = raw.split(';').next() else {
+            continue;
+        };
+        let Some((name, value)) = pair.trim().split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim().trim_matches('"');
+        if name.is_empty() || value.is_empty() || value == "-" {
+            continue;
+        }
+        let domain = raw
+            .split(';')
+            .filter_map(|part| part.trim().strip_prefix("Domain=").or_else(|| part.trim().strip_prefix("domain=")))
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if let Some(existing) = cookies.iter_mut().find(|cookie| cookie.name.eq_ignore_ascii_case(name) && cookie.domain.eq_ignore_ascii_case(&domain)) {
+            existing.value = value.to_string();
+        } else {
+            cookies.push(StoredCookie {
+                name: name.to_string(),
+                value: value.to_string(),
+                domain,
+            });
+        }
+    }
+}
+
+fn url_path_only(url: &str) -> String {
+    url.split('?').next().unwrap_or(url).chars().take(180).collect()
+}
+
+fn error_without_secrets(message: &str) -> String {
+    let mut text = message.split("cookie").next().unwrap_or(message).trim().to_string();
+    if text.len() > 160 {
+        text.truncate(160);
+    }
+    text
 }
 
 pub fn parse_pdocs_document(body: &str, region: Region) -> Result<Vec<OwnedBook>, CloudError> {
@@ -1010,6 +1242,45 @@ mod tests {
         assert!(start_reading_url(Region::Us, "B0CLOUD001").contains("read.amazon.com"));
         assert!(annotations_url(Region::Br).contains("getAnnotations"));
         assert!(owned_content_url(Region::Br, "B0CLOUD001").contains("getOwnedContent"));
+    }
+
+    #[test]
+    fn store_cookie_wins_over_reader_host_cookie() {
+        let cookies = vec![
+            StoredCookie { name: "session-id".into(), value: "from-reader".into(), domain: "ler.amazon.com.br".into() },
+            StoredCookie { name: "session-id".into(), value: "from-store".into(), domain: ".amazon.com.br".into() },
+            StoredCookie { name: "at-acbbr".into(), value: "only-reader".into(), domain: "ler.amazon.com.br".into() },
+        ];
+        let store = cookie_header_for(&cookies, true);
+        assert!(store.contains("session-id=from-store"));
+        assert!(!store.contains("from-reader"));
+        assert!(store.contains("at-acbbr=only-reader"));
+        let reader = cookie_header_for(&cookies, false);
+        assert!(reader.contains("session-id=from-reader"));
+        assert!(!reader.contains("from-store"));
+    }
+
+    #[test]
+    fn csrf_and_signin_page_are_detected() {
+        let html = r#"<script>var config = {"csrfToken":"abcDEF-12345678"};</script>"#;
+        assert_eq!(extract_csrf(html).as_deref(), Some("abcDEF-12345678"));
+        let meta = r#"<meta name="csrf-token" content="metaTOKEN1234">"#;
+        assert_eq!(extract_csrf(meta).as_deref(), Some("metaTOKEN1234"));
+        assert!(looks_like_signin("https://www.amazon.com.br/ap/signin?openid=1", ""));
+        assert!(looks_like_signin("https://www.amazon.com.br/hz/mycd", "<form id=\"ap_signin_form\">"));
+        assert!(!looks_like_signin(
+            "https://www.amazon.com.br/hz/mycd/digital-console/contentlist/pdocs/dateDsc",
+            r#"{"GetContentOwnershipData":{"items":[]}}"#,
+        ));
+    }
+
+    #[test]
+    fn personal_doc_payload_parses() {
+        let body = r#"{"GetContentOwnershipData":{"items":[{"asin":"0123456789abcdef0123456789abcdef","title":"Codigo limpo (Portuguese Edition)","authors":["Robert C. Martin"]}]}}"#;
+        let books = parse_pdocs_document(body, Region::Br).expect("pdocs");
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Codigo limpo");
+        assert!(books[0].asin.len() > 12);
     }
 
     #[test]

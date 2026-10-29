@@ -213,13 +213,18 @@ export function App() {
             onRemoveBookmark={(id) => void removeBookmark(id).then(() => refresh())}
           />
         ) : view === 'shelf' ? (
-          <Shelf
+            <Shelf
             books={snap.books}
             query={query}
             onQuery={setQuery}
             onOpen={(book) => void openBook(book)}
             onRemove={(book) => void removeBook(book.id).then(setSnap)}
             signedIn={snap.session.signedIn}
+            notice={snap.syncNotice}
+            onRetry={() => {
+              setBusy(true)
+              void cloudSync(snap.settings.region).then(setSnap).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Falha ao sincronizar')).finally(() => setBusy(false))
+            }}
             onLogin={() => void cloudOpenLogin(snap.settings.region).catch((error: unknown) => setMessage(error instanceof Error ? error.message : 'Abra pelo aplicativo de desktop para entrar na Amazon'))}
             onImport={() => setView('settings')}
           />

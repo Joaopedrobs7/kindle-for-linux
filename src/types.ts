@@ -68,6 +68,7 @@ export interface Snapshot {
   settings: Settings
   session: SessionStatus
   folders: string[]
+  syncNotice: string
 }
 
 export interface Definition {
