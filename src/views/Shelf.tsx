@@ -33,8 +33,8 @@ export function Shelf({
       .slice()
       .sort((a, b) => Number(b.percentage > 0) - Number(a.percentage > 0) || a.title.localeCompare(b.title, 'pt'))
   }, [books, query])
-  const local = books.filter((book) => book.source !== 'cloud').length
-  const cloud = books.length - local
+  const local = books.filter((book) => book.source !== 'cloud' && !book.missing).length
+  const cloud = books.filter((book) => book.source === 'cloud').length
 
   return (
     <section className="page" data-testid="bookshelf">

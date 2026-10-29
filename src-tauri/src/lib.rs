@@ -20,8 +20,9 @@ use tauri::{
 
 use crate::db::Db;
 use crate::kindle_cloud::{
-    absorb_tokens, annotations_url, fetch_annotations, fetch_library, fetch_position, interesting_names, login_url,
-    owned_content_url, parse_cookie_header, reader_url, start_reading_url, Region, SessionMaterial, READER_QUIET_CSS,
+    absorb_tokens, annotations_url, duplicate_store_cookies, fetch_annotations, fetch_library, fetch_position,
+    interesting_names, login_url, on_store_documents, owned_content_url, parse_cookie_header, reader_url,
+    start_reading_url, store_documents_url, Region, SessionMaterial, READER_QUIET_CSS,
 };
 use crate::model::{BookmarkInput, HighlightInput, ProgressInput, Settings, StoredCookie, StoredSession};
 
@@ -214,32 +215,63 @@ async fn cloud_sync(app: AppHandle, region: Option<String>) -> Result<model::Sna
             session.region = Region::parse(&region).as_str().into();
             db.save_session(&session)?;
         }
+        let region_parsed = Region::parse(&session.region);
+        let copied = duplicate_store_cookies(&mut session.cookies, region_parsed);
+        if copied > 0 {
+            log_sync(&app, &format!("cookies do leitor copiados para a loja: {copied}"));
+        }
+        db.save_session(&session)?;
+        if let Some(main_wv) = app.get_webview("main") {
+            push_session_cookies(&main_wv, &session);
+        }
         if let Some(window) = app.get_webview_window("main") {
-            let fresh = collect_login_cookies(&window, Region::parse(&session.region));
+            let fresh = collect_login_cookies(&window, region_parsed);
             if !fresh.is_empty() {
                 session.cookies = merge_cookies(session.cookies, fresh);
                 db.save_session(&session)?;
             }
         }
-        let _ = db.ensure_default_folders();
-        let _ = db.scan();
-        let folders = db.folders().unwrap_or_default();
-        let present: Vec<_> = folders.iter().filter(|folder| PathBuf::from(folder).is_dir()).cloned().collect();
-        let absent: Vec<_> = folders.iter().filter(|folder| !PathBuf::from(folder).is_dir()).cloned().collect();
-        let local = db
-            .snapshot()
-            .map(|snap| snap.books.iter().filter(|book| book.source == "local" && !book.missing).count())
-            .unwrap_or(0);
-        log_sync(&app, &format!("epubs no disco: {local}; pastas: {}; ausentes: {}", present.join(", "), absent.join(", ")));
+        if let Ok(report) = db.scan_local() {
+            log_sync(&app, &format!("pastas varridas: {}", report.folders.join(" | ")));
+            if report.files.is_empty() {
+                log_sync(&app, "nenhum epub, pdf, mobi ou azw3 nessas pastas");
+            }
+            for file in &report.files {
+                log_sync(&app, &format!("no disco {file}"));
+            }
+        }
         material_from(&session)?
     };
-    let loaded = match fetch_library(&material).await {
+    let mut loaded = match fetch_library(&material).await {
         Ok(loaded) => loaded,
         Err(error) => {
             log_sync(&app, &format!("biblioteca: {error}"));
             return Err(error.to_string());
         }
     };
+    if loaded.needs_store_login {
+        log_sync(&app, "documentos pessoais pediram a loja; tentando a sessão do leitor em segundo plano");
+        if silent_store_refresh(&app, material.region).await {
+            let next = {
+                let state = app.state::<AppState>();
+                let db = state.db.lock().map_err(|error| error.to_string())?;
+                let session = db.session()?;
+                material_from(&session)
+            };
+            if let Ok(next) = next {
+                match fetch_library(&next).await {
+                    Ok(again) => loaded = again,
+                    Err(error) => log_sync(&app, &format!("biblioteca após a loja oculta: {error}")),
+                }
+            }
+        }
+    }
+    if loaded.needs_store_login {
+        log_sync(&app, "a loja ainda pediu login; abrindo a página de documentos");
+        if open_amazon_window(&app, "amazon-store", "Documentos Kindle", &store_documents_url(material.region), "").is_ok() {
+            spawn_store_login_watcher(app.clone(), material.region);
+        }
+    }
     if let Some(reason) = &loaded.personal_docs_error {
         log_sync(&app, &format!("documentos pessoais: {reason}"));
     } else {
@@ -418,6 +450,141 @@ fn set_fullscreen(app: AppHandle, enabled: bool) -> Result<(), String> {
         window.set_fullscreen(enabled).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+async fn silent_store_refresh(app: &AppHandle, region: Region) -> bool {
+    {
+        let state = app.state::<AppState>();
+        let Ok(db) = state.db.lock() else {
+            return false;
+        };
+        let Ok(mut session) = db.session() else {
+            return false;
+        };
+        duplicate_store_cookies(&mut session.cookies, region);
+        if db.save_session(&session).is_err() {
+            return false;
+        }
+        if let Some(main_wv) = app.get_webview("main") {
+            push_session_cookies(&main_wv, &session);
+        }
+    }
+    let url = store_documents_url(region);
+    if open_hidden_store_window(app, &url).is_err() {
+        log_sync(app, "não abriu a loja em segundo plano");
+        return false;
+    }
+    let mut landed = false;
+    let mut signin_hits = 0u8;
+    for _ in 0..16 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let Some(window) = app.get_webview_window("amazon-store-silent") else {
+            break;
+        };
+        let page = window.url().map(|url| url.to_string()).unwrap_or_default();
+        log_sync(app, &format!("loja oculta {}", page.split('?').next().unwrap_or(&page)));
+        if on_store_documents(&page) {
+            landed = true;
+            break;
+        }
+        if page.contains("/ap/") {
+            signin_hits += 1;
+            if signin_hits >= 4 {
+                break;
+            }
+        }
+    }
+    if let Some(window) = app.get_webview_window("amazon-store-silent") {
+        let fresh = collect_login_cookies(&window, region);
+        if let Some(state) = app.try_state::<AppState>() {
+            if let Ok(db) = state.db.lock() {
+                if let Ok(mut session) = db.session() {
+                    session.cookies = merge_cookies(session.cookies, fresh);
+                    let _ = db.save_session(&session);
+                }
+            }
+        }
+        let _ = window.close();
+    }
+    if landed {
+        log_sync(app, "a loja aceitou a sessão do leitor sem novo login");
+    } else {
+        log_sync(app, "a loja oculta caiu no login");
+    }
+    true
+}
+
+fn open_hidden_store_window(app: &AppHandle, target: &str) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window("amazon-store-silent") {
+        let _ = existing.close();
+    }
+    let url = target.parse().map_err(|error: url::ParseError| error.to_string())?;
+    WebviewWindowBuilder::new(app, "amazon-store-silent", WebviewUrl::External(url))
+        .title("Amazon")
+        .inner_size(900.0, 640.0)
+        .visible(false)
+        .focused(false)
+        .skip_taskbar(true)
+        .user_agent(kindle_cloud::CHROME_UA)
+        .initialization_script("if (!window.chrome) { window.chrome = { runtime: {} }; }")
+        .build()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn spawn_store_login_watcher(app: AppHandle, region: Region) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let Some(window) = app.get_webview_window("amazon-store") else {
+                break;
+            };
+            let page = window.url().map(|url| url.to_string()).unwrap_or_default();
+            if !on_store_documents(&page) {
+                continue;
+            }
+            let fresh = collect_login_cookies(&window, region);
+            let material = {
+                let Some(state) = app.try_state::<AppState>() else {
+                    break;
+                };
+                let Ok(db) = state.db.lock() else {
+                    break;
+                };
+                let Ok(mut session) = db.session() else {
+                    break;
+                };
+                session.cookies = merge_cookies(session.cookies, fresh);
+                absorb_tokens(&session.cookies, &mut session.uhura, &mut session.device_session_token);
+                if db.save_session(&session).is_err() {
+                    break;
+                }
+                let Ok(material) = material_from(&session) else {
+                    break;
+                };
+                material
+            };
+            match fetch_library(&material).await {
+                Ok(loaded) => {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        if let Ok(db) = state.db.lock() {
+                            let _ = db.upsert_cloud(&loaded.books);
+                            let _ = db.set_sync_notice(loaded.personal_docs_error.as_deref().unwrap_or(""));
+                        }
+                    }
+                    if let Some(reason) = &loaded.personal_docs_error {
+                        log_sync(&app, &format!("documentos pessoais após o login da loja: {reason}"));
+                    } else {
+                        log_sync(&app, "documentos pessoais atualizados depois do login da loja");
+                    }
+                    let _ = window.close();
+                    let _ = app.emit("library-changed", ());
+                    break;
+                }
+                Err(error) => log_sync(&app, &format!("biblioteca após o login da loja: {error}")),
+            }
+        }
+    });
 }
 
 fn spawn_login_watcher(app: AppHandle, region: Region) {

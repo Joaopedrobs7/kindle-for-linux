@@ -39,6 +39,7 @@ pub enum CloudError {
 pub struct LibraryLoad {
     pub books: Vec<OwnedBook>,
     pub personal_docs_error: Option<String>,
+    pub needs_store_login: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +158,62 @@ pub fn reader_url(region: Region, asin: &str) -> String {
 
 pub fn login_url(region: Region) -> String {
     format!("{}/kindle-library", region.origin())
+}
+
+pub fn store_documents_url(region: Region) -> String {
+    format!("{}/hz/mycd/digital-console/contentlist/pdocs/dateDsc", region.store_origin())
+}
+
+pub fn on_store_documents(url: &str) -> bool {
+    if url.contains("/ap/") {
+        return false;
+    }
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.contains("/contentlist/pdocs") || path.contains("/digital-console/contentlist")
+}
+
+/// Copies the reader-host auth cookies onto the www store domain. Amazon BR uses the
+/// same `at-acbbr`, `sess-at-acbbr`, `ubid-acbbr`, `x-acbbr` and `session-id` across `.amazon.com.br`.
+pub fn duplicate_store_cookies(cookies: &mut Vec<StoredCookie>, region: Region) -> usize {
+    let domains: &[&str] = match region {
+        Region::Br => &[".amazon.com.br", "www.amazon.com.br", "amazon.com.br"],
+        Region::Us => &[".amazon.com", "www.amazon.com", "amazon.com"],
+    };
+    let names = [
+        "at-acbbr",
+        "sess-at-acbbr",
+        "ubid-acbbr",
+        "x-acbbr",
+        "session-id",
+        "session-id-time",
+        "at-main",
+        "sess-at-main",
+        "ubid-main",
+        "x-main",
+        "session-token",
+    ];
+    let snapshot = cookies.clone();
+    let mut added = 0usize;
+    for cookie in snapshot {
+        if cookie.value.is_empty() || !names.iter().any(|name| cookie.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        for domain in domains {
+            let exists = cookies
+                .iter()
+                .any(|item| item.name.eq_ignore_ascii_case(&cookie.name) && item.domain.eq_ignore_ascii_case(domain));
+            if exists {
+                continue;
+            }
+            cookies.push(StoredCookie {
+                name: cookie.name.clone(),
+                value: cookie.value.clone(),
+                domain: (*domain).to_string(),
+            });
+            added += 1;
+        }
+    }
+    added
 }
 
 pub fn request_headers(session: &SessionMaterial) -> Vec<(String, String)> {
@@ -418,20 +475,24 @@ pub async fn fetch_library(session: &SessionMaterial) -> Result<LibraryLoad, Clo
             }
         }
     }
-    let personal_docs_error = match fetch_pdocs(&client, session).await {
+    let (personal_docs_error, needs_store_login) = match fetch_pdocs(&client, session).await {
         Ok(pdocs) => {
             if !pdocs.is_empty() {
                 pages.push(pdocs);
             }
-            None
+            (None, false)
         }
-        Err(error) => Some(error.to_string()),
+        Err(error) => {
+            let needs_store_login = matches!(error, CloudError::NeedsReauth | CloudError::PersonalDocs(_));
+            (Some(error.to_string()), needs_store_login)
+        }
     };
     let mut merged = merge_pages(&pages);
     hydrate_library_progress(&client, session, &mut merged).await;
     Ok(LibraryLoad {
         books: merged,
         personal_docs_error,
+        needs_store_login,
     })
 }
 
@@ -1255,6 +1316,13 @@ mod tests {
         assert!(store.contains("session-id=from-store"));
         assert!(!store.contains("from-reader"));
         assert!(store.contains("at-acbbr=only-reader"));
+        let mut saved = cookies.clone();
+        let added = duplicate_store_cookies(&mut saved, Region::Br);
+        assert!(added >= 2);
+        assert!(saved.iter().any(|cookie| cookie.name == "at-acbbr" && cookie.domain == "www.amazon.com.br"));
+        assert!(saved.iter().any(|cookie| cookie.name == "session-id" && cookie.domain == ".amazon.com.br" && cookie.value == "from-store"));
+        assert!(on_store_documents("https://www.amazon.com.br/hz/mycd/digital-console/contentlist/pdocs/dateDsc"));
+        assert!(!on_store_documents("https://www.amazon.com.br/ap/signin?return_to=/hz/mycd/digital-console/contentlist/pdocs/dateDsc"));
         let reader = cookie_header_for(&cookies, false);
         assert!(reader.contains("session-id=from-reader"));
         assert!(!reader.contains("from-store"));

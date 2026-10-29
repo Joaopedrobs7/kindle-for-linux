@@ -3,7 +3,7 @@ set -eu
 
 REPO="Joaopedrobs7/kindle-for-linux"
 LATEST_API="https://api.github.com/repos/${REPO}/releases/latest"
-FALLBACK_DEB_URL="https://github.com/${REPO}/releases/download/v2.0.1/kindle-para-linux_2.0.1_amd64.deb"
+FALLBACK_DEB_URL="https://github.com/${REPO}/releases/download/v2.0.2/kindle-para-linux_2.0.2_amd64.deb"
 APT_REPO="https://joaopedrobs7.github.io/kindle-for-linux"
 LIST_PATH="/etc/apt/sources.list.d/kindle-linux.list"
 LIST_LINE="deb [trusted=yes] ${APT_REPO} ./"
@@ -104,8 +104,8 @@ install_linux() {
     DEB_URL=$FALLBACK_DEB_URL
   fi
   case $DEB_URL in
-    */kindle-para-linux_2.0.1_amd64.deb)
-      DEB_PATH=/tmp/kindle-para-linux_2.0.1_amd64.deb
+    */kindle-para-linux_2.0.2_amd64.deb)
+      DEB_PATH=/tmp/kindle-para-linux_2.0.2_amd64.deb
       ;;
     *)
       DEB_PATH=/tmp/kindle-para-linux.deb

@@ -163,13 +163,17 @@ impl Db {
     }
 
     pub fn scan(&self) -> Result<bool, String> {
+        Ok(self.scan_local()?.changed)
+    }
+
+    pub fn scan_local(&self) -> Result<LocalScan, String> {
         let _ = self.ensure_default_folders();
         let folders = self.folders()?;
         let mut found = Vec::new();
         for folder in &folders {
             let path = PathBuf::from(folder);
             if path.is_dir() {
-                collect_epubs(&path, &mut found, 0);
+                collect_local_books(&path, &mut found, 0);
             }
         }
         let mut changed = false;
@@ -189,7 +193,11 @@ impl Db {
                 changed = true;
             }
         }
-        Ok(changed)
+        Ok(LocalScan {
+            changed,
+            folders,
+            files: found.iter().map(|path| path.display().to_string()).collect(),
+        })
     }
 
     pub fn import_path(&self, source: &Path) -> Result<(), String> {
@@ -430,8 +438,14 @@ impl Db {
     }
 
     fn upsert_local(&self, path: &Path) -> Result<bool, String> {
-        let meta = read_epub_meta(path)?;
-        let clean_meta_title = clean_title(&meta.title);
+        let (clean_meta_title, author, cover) = if path.extension().and_then(|ext| ext.to_str()).unwrap_or("").eq_ignore_ascii_case("epub") {
+            match read_epub_meta(path) {
+                Ok(meta) => (clean_title(&meta.title), meta.author, meta.cover_data_url),
+                Err(_) => (file_title(path), "Arquivo local".into(), String::new()),
+            }
+        } else {
+            (file_title(path), "Arquivo local".into(), String::new())
+        };
         let id = format!("local:{}", path.display());
         let existed: i64 = self
             .conn
@@ -446,7 +460,7 @@ impl Db {
                    author = excluded.author,
                    cover = excluded.cover,
                    missing = 0",
-                params![id, clean_meta_title, meta.author, path.display().to_string(), meta.cover_data_url, now_ms()],
+                params![id, clean_meta_title, author, path.display().to_string(), cover, now_ms()],
             )
             .map_err(|error| error.to_string())?;
         let _ = self.dedup_pdocs_against_local();
@@ -572,7 +586,28 @@ impl Db {
     }
 }
 
+pub struct LocalScan {
+    pub changed: bool,
+    pub folders: Vec<String>,
+    pub files: Vec<String>,
+}
+
 pub fn default_folders() -> Vec<PathBuf> {
+    let mut folders = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let base = PathBuf::from(&home);
+        let documents = user_dir("XDG_DOCUMENTS_DIR", &home);
+        let downloads = user_dir("XDG_DOWNLOAD_DIR", &home);
+        folders = home_library_folders(&base, documents.as_deref(), downloads.as_deref());
+    }
+    let workspace = PathBuf::from("/workspace/kindle");
+    if workspace.is_dir() && !folders.iter().any(|path| path == &workspace) {
+        folders.push(workspace);
+    }
+    folders
+}
+
+pub fn home_library_folders(home: &Path, documents: Option<&Path>, downloads: Option<&Path>) -> Vec<PathBuf> {
     let mut folders = Vec::new();
     let mut push = |path: PathBuf| {
         if path.as_os_str().is_empty() || folders.iter().any(|item| item == &path) {
@@ -580,22 +615,21 @@ pub fn default_folders() -> Vec<PathBuf> {
         }
         folders.push(path);
     };
-    if let Ok(home) = std::env::var("HOME") {
-        let base = PathBuf::from(&home);
-        let documents = user_dir("XDG_DOCUMENTS_DIR", &home).unwrap_or_else(|| base.join("Documents"));
-        let downloads = user_dir("XDG_DOWNLOAD_DIR", &home).unwrap_or_else(|| base.join("Downloads"));
-        push(documents.join("Kindle"));
-        push(downloads);
-        push(documents.clone());
-        push(base.join("Documents/Kindle"));
-        push(base.join("Downloads"));
-        push(base.join("Documents"));
-        push(base.join("Documentos"));
-    }
-    let workspace = PathBuf::from("/workspace/kindle");
-    if workspace.is_dir() {
-        push(workspace);
-    }
+    let documents = documents.map(Path::to_path_buf).unwrap_or_else(|| home.join("Documents"));
+    let downloads = downloads.map(Path::to_path_buf).unwrap_or_else(|| home.join("Downloads"));
+    push(downloads);
+    push(documents.clone());
+    push(documents.join("Kindle"));
+    push(documents.join("Livros"));
+    push(home.join("Downloads"));
+    push(home.join("Documents"));
+    push(home.join("Documentos"));
+    push(home.join("Livros"));
+    push(home.join("Kindle"));
+    push(home.join("Documents/Kindle"));
+    push(home.join("Documents/Livros"));
+    push(home.join("Documentos/Kindle"));
+    push(home.join("Documentos/Livros"));
     folders
 }
 
@@ -626,7 +660,7 @@ fn parse_user_dir(text: &str, key: &str, home: &str) -> Option<PathBuf> {
     None
 }
 
-fn collect_epubs(dir: &Path, found: &mut Vec<PathBuf>, depth: u8) {
+fn collect_local_books(dir: &Path, found: &mut Vec<PathBuf>, depth: u8) {
     if depth > 4 || found.len() > 400 {
         return;
     }
@@ -643,11 +677,23 @@ fn collect_epubs(dir: &Path, found: &mut Vec<PathBuf>, depth: u8) {
             continue;
         }
         if path.is_dir() {
-            collect_epubs(&path, found, depth + 1);
-        } else if name.to_ascii_lowercase().ends_with(".epub") {
+            collect_local_books(&path, found, depth + 1);
+        } else if is_local_book(name) {
             found.push(path);
         }
     }
+}
+
+fn is_local_book(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".epub") || lower.ends_with(".pdf") || lower.ends_with(".mobi") || lower.ends_with(".azw3")
+}
+
+fn file_title(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Livro")
+        .replace(['_', '-'], " ")
 }
 
 
@@ -729,5 +775,19 @@ mod tests {
             parse_user_dir(text, "XDG_DOWNLOAD_DIR", "/home/joao").unwrap(),
             PathBuf::from("/home/joao/Downloads")
         );
+        let folders = home_library_folders(
+            Path::new("/home/joao"),
+            Some(Path::new("/home/joao/Documentos")),
+            Some(Path::new("/home/joao/Downloads")),
+        );
+        assert!(folders.iter().any(|path| path.ends_with("Documentos/Livros")));
+        assert!(folders.iter().any(|path| path.ends_with("Documentos/Kindle")));
+        assert!(folders.iter().any(|path| path == Path::new("/home/joao/Kindle")));
+        assert!(folders.iter().any(|path| path == Path::new("/home/joao/Downloads")));
+        assert!(is_local_book("livro.EPUB"));
+        assert!(is_local_book("notas.pdf"));
+        assert!(is_local_book("kindle.mobi"));
+        assert!(is_local_book("sample.azw3"));
+        assert!(!is_local_book("capa.jpg"));
     }
 }
