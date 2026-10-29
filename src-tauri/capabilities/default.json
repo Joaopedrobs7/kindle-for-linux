@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Janela principal",
-  "windows": ["main", "amazon-login", "cloud-reader"],
+  "windows": ["main", "amazon-login", "amazon-store", "amazon-store-silent", "cloud-reader"],
   "permissions": [
     "core:default",
     "core:window:allow-set-fullscreen",
