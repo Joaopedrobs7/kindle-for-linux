@@ -115,7 +115,7 @@ install_linux() {
   download "$DEB_URL" "$DEB_PATH"
 
   $SUDO DEBIAN_FRONTEND=noninteractive apt-get update < /dev/null \
-    && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB_PATH" < /dev/null
+    && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$DEB_PATH" < /dev/null
 
   configure_apt_repo
   echo "==> Instalado! Rode 'kindle-linux' ou abra pelo menu de apps."
